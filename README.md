@@ -45,7 +45,7 @@
 <img src="./images/img_3.png">
 <img src="./images/img_4.png">
 
-**手机号验证登录（公开注册页，无需口令 / 邀请码）**
+**手机号验证注册同步到号池  **
 
 <img src="./images/img_5.png">
 
