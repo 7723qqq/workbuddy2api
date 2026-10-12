@@ -14,12 +14,14 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import anyio
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from admin import backend, pool, model_limits
+from admin import backend, pool, model_limits, model_catalog, upstream_http, request_metrics
 from admin import client_profile as cprofile
 from admin.config import settings
 from admin.db import SessionLocal, get_db
@@ -413,6 +415,8 @@ _CHAT_SEQ = itertools.count(1)
 
 def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kind=""):
     """向 stdout 打印一行表格日志，便于排查慢请求与风控。"""
+    if os.getenv('WORKBUDDY_ANDROID') == '1':
+        request_metrics.mark_upstream_error(error_kind or 'unknown', status)
     seq = next(_CHAT_SEQ)
     now = datetime.now().strftime("%H:%M:%S")
     model = (model or "-")[:11]
@@ -1065,6 +1069,8 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
     每次**成功**都会清空连续失败计数（见 `_note_success`），所以偶发抖动不会
     累积成熔断 —— 只有真正持续坏的账号才会被摘出去。
     """
+    if os.getenv('WORKBUDDY_ANDROID') == '1':
+        request_metrics.mark_upstream_error(kind, status)
     now = datetime.utcnow()
     if kind == "hard_credit":
         acc.cool_until = _next_day_4am(now)
@@ -1371,7 +1377,7 @@ def _account_session_safe(db: Session, acc: Account) -> backend.AccountSession |
     """
     sess = backend.AccountSession(acc.auth_json)
     try:
-        sess.get_headers()  # 内部会触发 token 刷新并写临时文件
+        sess._gateway_headers = sess.get_headers()  # Prepare/refresh once per attempt.
         return sess
     except Exception as e:
         msg = str(e)
@@ -1386,28 +1392,75 @@ def _account_session_safe(db: Session, acc: Account) -> backend.AccountSession |
         return None
 
 
-async def _blocking_call(fn, *args, on_cancel=None):
+def _headers_for_attempt(sess, extra):
+    prepared = getattr(sess, '_gateway_headers', None)
+    if isinstance(prepared, dict):
+        return {**prepared, **extra}
+    return sess.get_headers(extra=extra)
+
+
+async def _blocking_call(fn, *args, on_cancel=None, **kwargs):
     """Run synchronous upstream I/O off the event loop; drain before DB cleanup.
 
     A cancelled to_thread call keeps running in its worker. Shield and await it
     so the enclosing request cannot close a Session still in use by that worker.
     """
-    task = asyncio.create_task(asyncio.to_thread(fn, *args))
+    started = time.perf_counter()
+    request_metrics.set_phase(getattr(fn, '__name__', 'worker'))
+    task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         try:
-            result = await asyncio.shield(task)
-            if on_cancel is not None and result is not None:
-                on_cancel(result)
+            with anyio.CancelScope(shield=True):
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                result = task.result()
+                if on_cancel is not None and result is not None:
+                    on_cancel(result)
         except Exception:
             pass
         raise
+    finally:
+        elapsed = (time.perf_counter() - started) * 1000
+        request_metrics.add_stage(getattr(fn, '__name__', 'worker'), elapsed)
+        if elapsed >= 250:
+            _logger.info("local-stage stage=%s elapsed_ms=%d", getattr(fn, '__name__', 'worker'), elapsed)
 
 
 async def _account_session_async(db: Session, acc: Account):
     return await _blocking_call(_account_session_safe, db, acc,
                                 on_cancel=lambda session: session.close())
+
+
+def _client_stream(source):
+    if os.getenv('WORKBUDDY_ANDROID') == '1':
+        from admin.mobile_stream import events
+        return events(source)
+    return source
+
+
+async def _request_json(request):
+    # A disconnect while uploading is distinct from malformed JSON. Preserve
+    # the existing HTTP response while exposing the actual cause in diagnostics.
+    with request_metrics.measure('read_request_body'):
+        try:
+            return await request.json()
+        except ClientDisconnect:
+            request_metrics.mark_request_error('client_disconnected')
+            raise
+        except json.JSONDecodeError:
+            request_metrics.mark_request_error('invalid_json')
+            raise
+        except UnicodeDecodeError:
+            request_metrics.mark_request_error('invalid_encoding')
+            raise
+        except Exception:
+            request_metrics.mark_request_error('body_read_failed')
+            raise
 
 
 _CREDIT_RE = re.compile(r"x\s*([0-9]+(?:\.[0-9]+)?)")
@@ -1774,24 +1827,16 @@ def _pick_best_model(db: Session, requested_model: str,
         return None  # 分组内无可用模型（都被禁用）
 
     if not has_any_config:
-        # 无本地配置时：尝试从后端拉一次模型列表来选免费模型
+        # Cache discovery: a chat must not fetch the model catalog on every turn.
         try:
             acc_tmp = _select_account(db)
             if acc_tmp:
-                with backend.AccountSession(acc_tmp.auth_json) as sess:
-                    raw_models = sess.fetch_models()
-                # 选第一个 credits 为 0 或含 "free"/"x0.00" 的模型
-                for rm in raw_models:
-                    mid = rm.get("id", "")
-                    if mid and mid.lower() != "auto":
-                        cred = str(rm.get("credits") or "")
-                        if not cred or "x0.00" in cred or "free" in cred.lower():
-                            return mid
-                # 没有免费模型就返回第一个非 auto
-                for rm in raw_models:
-                    mid = rm.get("id", "")
-                    if mid and mid.lower() != "auto":
-                        return mid
+                def fetch():
+                    with backend.AccountSession(acc_tmp.auth_json) as sess:
+                        return sess.fetch_models()
+                selected = model_catalog.auto_model(acc_tmp.auth_json, settings.BACKEND, fetch)
+                if selected:
+                    return selected
         except Exception:
             pass
         return "deepseek-v4-flash"  # 兜底：无配置且后端不可达时用默认模型
@@ -2055,13 +2100,14 @@ async def chat_completions(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
 ):
+    request_start = time.perf_counter()
     api_key = x_api_key
     if not api_key and authorization and authorization.startswith("Bearer "):
         api_key = authorization[7:].strip()
     if not api_key:
         return JSONResponse(status_code=401, content={"error": {"message": "缺少 API Key", "type": "auth_error"}})
 
-    key = get_key_row(db, api_key)
+    key = await _blocking_call(get_key_row, db, api_key)
     if not key:
         return JSONResponse(status_code=401, content={"error": {"message": "无效 API Key", "type": "auth_error"}})
     try:
@@ -2070,14 +2116,14 @@ async def chat_completions(
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
     try:
-        payload = await request.json()
+        payload = await _request_json(request)
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
     model = payload.get("model", "auto")
 
     # 模型白名单检查 + 免费优先选择（绑定了分组的 Key 只在组内选择）
-    allowed = _key_group_models(db, key)
+    allowed = await _blocking_call(_key_group_models, db, key)
     resolved_model = await _blocking_call(_pick_best_model, db, model, allowed)
     if resolved_model is None:
         if allowed is not None and model not in ("auto", ""):
@@ -2089,7 +2135,7 @@ async def chat_completions(
 
     # 候选模型顺序：auto 模式按 免费→付费 排列，支持上游 429/5xx 自动切换下一个
     if model in ("auto", ""):
-        order = [resolved_model] + _candidate_models(db, {resolved_model}, allowed)
+        order = [resolved_model] + await _blocking_call(_candidate_models, db, {resolved_model}, allowed)
         order = order[:8]  # 最多尝试 8 个，避免全局限流时反复重试
     else:
         order = [resolved_model]  # 具体模型：不静默切换，失败即报错
@@ -2125,7 +2171,6 @@ async def chat_completions(
         held_uid = ""  # 当前持有的在途租约
         sess_i = None
         try:
-            request_start = time.perf_counter()
             ttfb_at = None
             status_out = 503
             seq = None
@@ -2144,7 +2189,7 @@ async def chat_completions(
             tried_accounts = 0   # 供「全部失败」提示说明尝试规模
             tried_models_n = 0
 
-            async with httpx.AsyncClient(timeout=_stream_timeout(), limits=backend.HTTP_LIMITS) as client:
+            async with upstream_http.client(request, _stream_timeout(), backend.HTTP_LIMITS) as client:
                 for m in order:
                     if not retry_budget.available():
                         break
@@ -2161,7 +2206,7 @@ async def chat_completions(
                             break
                         if not retry_budget.available():
                             break
-                        acc_i = _select_account(db2, exclude_ids=tried_ids, min_balance=1,
+                        acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
                                                 model=m, sticky_key=sticky_key)
                         if not acc_i:
                             break
@@ -2179,21 +2224,21 @@ async def chat_completions(
                             held_uid = ""
                             continue
                         # 会话头族 + 账号级设备标识按本次账号重算（设备标识是账号维度）
-                        extra = _upstream_extra_headers(request)
+                        extra = await _blocking_call(_upstream_extra_headers, request)
                         extra.update(session_hdr)
                         if acc_i.uid:
                             extra["X-Machine-ID"] = backend.stable_device_id(acc_i.uid, "machine")
                             extra["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
-                        headers_i = sess_i.get_headers(extra=extra)
+                        headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra)
                         try:
                             async with client.stream("POST", url, headers=headers_i, json=body) as r:
                                 if r.status_code >= 400:
                                     detail = await r.aread()
                                     text = detail[:65536].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:65536]
                                     kind = _classify_error(r.status_code, text)
-                                    _apply_account_policy(db2, acc_i, kind, r.status_code, text,
+                                    await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                           model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
-                                    _maybe_degrade(db2, acc_i)
+                                    await _blocking_call(_maybe_degrade, db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
@@ -2262,12 +2307,11 @@ async def chat_completions(
                                     else None
                                 )
                                 async for chunk in r.aiter_text():
-                                    if ttfb_at is None:
-                                        ttfb_at = time.perf_counter()
                                     collected.append(chunk)
                                     clean = buf.feed_text(chunk)
                                     if buf.committed:
                                         if not aggregate and clean:
+                                            ttfb_at = ttfb_at or time.perf_counter()
                                             yield clean
                                         continue
                                     probe += chunk
@@ -2279,6 +2323,7 @@ async def chat_completions(
                                         if not aggregate:
                                             head = buf.commit()
                                             if head:
+                                                ttfb_at = ttfb_at or time.perf_counter()
                                                 yield head
                                         else:
                                             buf.commit()
@@ -2308,8 +2353,8 @@ async def chat_completions(
                             if truncated and can_retry:
                                 # 一个字节都没发出去 → 完整换号重试，用户无感
                                 kind = "upstream_internal"
-                                _apply_account_policy(db2, acc_i, kind, 200, text[:500], model=m)
-                                _maybe_degrade(db2, acc_i)
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, text[:500], model=m)
+                                await _blocking_call(_maybe_degrade, db2, acc_i)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2326,9 +2371,9 @@ async def chat_completions(
                             if stream_is_error:
                                 kind = _classify_error(200, text)
                                 if can_retry:
-                                    _apply_account_policy(db2, acc_i, kind, 200, text[:65536],
+                                    await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, text[:65536],
                                                           model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
-                                    _maybe_degrade(db2, acc_i)
+                                    await _blocking_call(_maybe_degrade, db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
@@ -2365,14 +2410,14 @@ async def chat_completions(
                                 latency_ms = int((time.perf_counter() - request_start) * 1000)
                                 seq = _log_chat_row(None, latency_ms, final_model, mode,
                                                     final_uid, 200, None, error_kind=kind)
-                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request),
                                               use_case="chat-completion", seq=seq,
                                               latency_ms=latency_ms, error_kind=kind)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
-                                _apply_account_policy(db2, acc_i, kind, 200, text[:500], model=m)
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, text[:500], model=m)
                                 return
                             # 流式模式下若始终没识别到正文（如仅角色帧就结束），
                             # 把缓冲补发给客户端，绝不静默吞掉内容。
@@ -2390,12 +2435,12 @@ async def chat_completions(
                             # 客户端每次重试都再命中它，就是这个号一直失败的原因。
                             if truncated:
                                 kind = "upstream_internal"
-                                _apply_account_policy(db2, acc_i, kind, 200, text[:500], model=m)
-                                _maybe_degrade(db2, acc_i)
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, text[:500], model=m)
+                                await _blocking_call(_maybe_degrade, db2, acc_i)
                                 latency_ms = int((time.perf_counter() - request_start) * 1000)
                                 seq = _log_chat_row(None, latency_ms, final_model, mode,
                                                     final_uid, 200, None, error_kind=kind)
-                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request),
                                               use_case="chat-completion", seq=seq,
                                               latency_ms=latency_ms, error_kind=kind)
@@ -2413,11 +2458,13 @@ async def chat_completions(
                             # 确认是健康响应后，才清空连败计数：
                             # 「200 但体内是错误」不该被记成一次成功。
                             acc_i.last_used_at = datetime.utcnow()
-                            _note_success(db2, acc_i)
+                            await _blocking_call(_note_success, db2, acc_i)
                             usage = _parse_usage(text)
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             status_out = 200
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
+                            if aggregate:
+                                ttfb_at = time.perf_counter()
                             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
                             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, mode, final_uid,
                                                 status_out, total_toks, error_kind="success")
@@ -2429,7 +2476,7 @@ async def chat_completions(
                             sess_i.close()
                             POOL.release(held_uid)
                             held_uid = ""
-                            _record_usage(key.id, final_acc_id, final_model, usage["credits"], updated,
+                            await _blocking_call(_record_usage, key.id, final_acc_id, final_model, usage["credits"], updated,
                                           client_ip=_client_ip(request), use_case="chat-completion",
                                           prompt_tokens=usage["prompt_tokens"],
                                           completion_tokens=usage["completion_tokens"],
@@ -2462,8 +2509,8 @@ async def chat_completions(
                                 held_uid = ""
                                 return
                             kind = _classify_error(0, _exc_text(e))
-                            _apply_account_policy(db2, acc_i, kind, 0, _exc_text(e), model=m)
-                            _maybe_degrade(db2, acc_i)
+                            await _blocking_call(_apply_account_policy, db2, acc_i, kind, 0, _exc_text(e), model=m)
+                            await _blocking_call(_maybe_degrade, db2, acc_i)
                             last_err_kind = kind
                             last_err_msg = _exc_text(e)
                             sess_i.close()
@@ -2477,7 +2524,7 @@ async def chat_completions(
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             err_kind = last_err_kind or ("no_account" if not last_err_msg else "transport")
             seq = _log_chat_row(None, latency_ms, final_model, mode, "-", status_out, None, error_kind=err_kind)
-            _record_usage(key.id, 0, final_model, 0.0, None,
+            await _blocking_call(_record_usage, key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
             err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n)
@@ -2495,11 +2542,11 @@ async def chat_completions(
                 POOL.release(held_uid)
             if sess_i is not None:
                 sess_i.close()
-            db2.close()
+            await _blocking_call(db2.close)
 
 
     if client_wants_stream:
-        return StreamingResponse(_stream(), media_type="text/event-stream",
+        return StreamingResponse(_client_stream(_stream()), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     # 非流式：复用同一套号池状态机，但把上游 SSE 聚合成单个 chat.completion。
@@ -2542,6 +2589,7 @@ async def responses_proxy(
     自动挑选健康账号；遇到余额不足 / session 死亡 / 限流 / 5xx 时自动换号，
     绝不把上游中断感传递给客户端。
     """
+    request_start = time.perf_counter()
     if not _RESPONSES_AVAILABLE:
         return JSONResponse(status_code=501, content={"error": {"message": "Responses 适配器未加载", "type": "not_supported"}})
 
@@ -2550,7 +2598,7 @@ async def responses_proxy(
         api_key = authorization[7:].strip()
     if not api_key:
         return JSONResponse(status_code=401, content={"error": {"message": "缺少 API Key", "type": "auth_error"}})
-    key = get_key_row(db, api_key)
+    key = await _blocking_call(get_key_row, db, api_key)
     if not key:
         return JSONResponse(status_code=401, content={"error": {"message": "无效 API Key", "type": "auth_error"}})
     try:
@@ -2559,7 +2607,7 @@ async def responses_proxy(
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
     try:
-        payload = await request.json()
+        payload = await _request_json(request)
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
@@ -2577,7 +2625,7 @@ async def responses_proxy(
     chat_body["stream_options"] = opts
 
     requested = payload.get("model", "auto")
-    allowed = _key_group_models(db, key)
+    allowed = await _blocking_call(_key_group_models, db, key)
     resolved = await _blocking_call(_pick_best_model, db, requested, allowed)
     if resolved is None:
         if allowed is not None and requested not in ("auto", ""):
@@ -2587,7 +2635,7 @@ async def responses_proxy(
 
     order = [resolved]
     if requested in ("auto", ""):
-        order = [resolved] + _candidate_models(db, {resolved}, allowed)
+        order = [resolved] + await _blocking_call(_candidate_models, db, {resolved}, allowed)
         order = order[:8]
 
     client_wants_stream = bool(payload.get("stream", True))
@@ -2621,7 +2669,7 @@ async def responses_proxy(
                         break
                     if not retry_budget.available():
                         break
-                    acc_i = _select_account(db2, exclude_ids=tried_ids, min_balance=1,
+                    acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
                                             model=m, sticky_key=sticky_key)
                     if not acc_i:
                         break
@@ -2635,21 +2683,21 @@ async def responses_proxy(
                         POOL.release(held_uid)
                         held_uid = ""
                         continue
-                    extra_i = _upstream_extra_headers(request)
+                    extra_i = await _blocking_call(_upstream_extra_headers, request)
                     extra_i.update(session_hdr)
                     if acc_i.uid:
                         extra_i["X-Machine-ID"] = backend.stable_device_id(acc_i.uid, "machine")
                         extra_i["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
-                    headers_i = sess_i.get_headers(extra=extra_i)
+                    headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra_i)
                     try:
-                        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=backend.HTTP_LIMITS) as client:
+                        async with upstream_http.client(request, _stream_timeout(), backend.HTTP_LIMITS) as client:
                             r = await client.post(url, headers=headers_i, json=body)
                             if r.status_code >= 400:
                                 text = r.text[:65536]
                                 kind = _classify_error(r.status_code, text)
-                                _apply_account_policy(db2, acc_i, kind, r.status_code, text,
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                       model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
-                                _maybe_degrade(db2, acc_i)
+                                await _blocking_call(_maybe_degrade, db2, acc_i)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2666,9 +2714,9 @@ async def responses_proxy(
                             # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：同样要换号。
                             if _looks_like_inband_error(r.text) or _sse_has_error_event(r.text):
                                 kind = _classify_error(200, r.text)
-                                _apply_account_policy(db2, acc_i, kind, 200, r.text[:65536], model=m,
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, r.text[:65536], model=m,
                                                       reset_at=_error_reset_at(r.headers, r.text))
-                                _maybe_degrade(db2, acc_i)
+                                await _blocking_call(_maybe_degrade, db2, acc_i)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2694,7 +2742,7 @@ async def responses_proxy(
                             obj = converter.get_nonstream_response()
                             cost_info = _parse_usage(r.text)
                             acc_i.last_used_at = datetime.utcnow()
-                            _note_success(db2, acc_i)  # 成功清零连败计数
+                            await _blocking_call(_note_success, db2, acc_i)  # 成功清零连败计数
                             updated = sess_i.updated_json()
                             total_toks = cost_info["total_tokens"] or cost_info["completion_tokens"]
                             seq = _log_chat_row(None, None, m, "resp", acc_i.uid or "-", 200, total_toks, error_kind="success")
@@ -2703,7 +2751,7 @@ async def responses_proxy(
                                 POOL.sticky.bind(sticky_key, held_uid)
                             POOL.release(held_uid)
                             held_uid = ""
-                            _record_usage(key.id, acc_i.id, m, cost_info["credits"], updated,
+                            await _blocking_call(_record_usage, key.id, acc_i.id, m, cost_info["credits"], updated,
                                           client_ip=_client_ip(request), use_case="responses",
                                           prompt_tokens=cost_info["prompt_tokens"],
                                           completion_tokens=cost_info["completion_tokens"],
@@ -2713,8 +2761,8 @@ async def responses_proxy(
                             return JSONResponse(content=obj)
                     except Exception as e:
                         kind = _classify_error(0, _exc_text(e))
-                        _apply_account_policy(db2, acc_i, kind, 0, _exc_text(e), model=m)
-                        _maybe_degrade(db2, acc_i)
+                        await _blocking_call(_apply_account_policy, db2, acc_i, kind, 0, _exc_text(e), model=m)
+                        await _blocking_call(_maybe_degrade, db2, acc_i)
                         sess_i.close()
                         POOL.release(held_uid)
                         held_uid = ""
@@ -2722,7 +2770,7 @@ async def responses_proxy(
                         rotate_idx += 1
                         continue
             seq = _log_chat_row(None, None, resolved, "resp", "-", 503, None, error_kind="no_account")
-            _record_usage(key.id, 0, resolved, 0.0, None,
+            await _blocking_call(_record_usage, key.id, 0, resolved, 0.0, None,
                           client_ip=_client_ip(request), use_case="responses", seq=seq, error_kind="no_account")
             if POOL.waf.active():
                 return JSONResponse(status_code=503, content={"error": {
@@ -2737,7 +2785,7 @@ async def responses_proxy(
                 POOL.release(held_uid)
             if sess_i is not None:
                 sess_i.close()
-            db2.close()
+            await _blocking_call(db2.close)
 
 
     async def _stream():
@@ -2745,7 +2793,6 @@ async def responses_proxy(
         held_uid = ""
         sess_i = None
         try:
-            request_start = time.perf_counter()
             ttfb_at = None
             seq = None
             final_model = resolved
@@ -2760,7 +2807,7 @@ async def responses_proxy(
                                            getattr(settings, "RETRY_WINDOW_SECONDS", 90))
             rotate_idx = 0
 
-            async with httpx.AsyncClient(timeout=_stream_timeout(), limits=backend.HTTP_LIMITS) as client:
+            async with upstream_http.client(request, _stream_timeout(), backend.HTTP_LIMITS) as client:
                 for m in order:
                     if not retry_budget.available():
                         break
@@ -2774,7 +2821,7 @@ async def responses_proxy(
                             break
                         if not retry_budget.available():
                             break
-                        acc_i = _select_account(db2, exclude_ids=tried_ids, min_balance=1,
+                        acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
                                                 model=m, sticky_key=sticky_key)
                         if not acc_i:
                             break
@@ -2788,12 +2835,12 @@ async def responses_proxy(
                             POOL.release(held_uid)
                             held_uid = ""
                             continue
-                        extra_i = _upstream_extra_headers(request)
+                        extra_i = await _blocking_call(_upstream_extra_headers, request)
                         extra_i.update(session_hdr)
                         if acc_i.uid:
                             extra_i["X-Machine-ID"] = backend.stable_device_id(acc_i.uid, "machine")
                             extra_i["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
-                        headers_i = sess_i.get_headers(extra=extra_i)
+                        headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra_i)
                         raw_lines.clear()
                         delivered = False
                         pending_events = []
@@ -2804,9 +2851,9 @@ async def responses_proxy(
                                     detail = await r.aread()
                                     text = detail[:65536].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:65536]
                                     kind = _classify_error(r.status_code, text)
-                                    _apply_account_policy(db2, acc_i, kind, r.status_code, text,
+                                    await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                           model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
-                                    _maybe_degrade(db2, acc_i)
+                                    await _blocking_call(_maybe_degrade, db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
@@ -2827,8 +2874,6 @@ async def responses_proxy(
                                 async for line in r.aiter_lines():
                                     if not line.strip():
                                         continue
-                                    if ttfb_at is None:
-                                        ttfb_at = time.perf_counter()
                                     raw_lines.append(line)
                                     if not delivered and (_looks_like_inband_error(line) or _sse_has_error_event(line)):
                                         break
@@ -2838,6 +2883,7 @@ async def responses_proxy(
                                     if delivered or _sse_has_content(line) or _sse_has_finish_reason(line):
                                         if pending_events:
                                             delivered = True
+                                            ttfb_at = ttfb_at or time.perf_counter()
                                             yield "".join(pending_events)
                                             pending_events.clear()
                             # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：
@@ -2846,9 +2892,9 @@ async def responses_proxy(
                             if (_looks_like_inband_error(_raw_text) or _sse_has_error_event(_raw_text)):
                                 kind = _classify_error(200, _raw_text)
                                 if not delivered:
-                                    _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:65536], model=m,
+                                    await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, _raw_text[:65536], model=m,
                                                           reset_at=_error_reset_at(r.headers, _raw_text))
-                                    _maybe_degrade(db2, acc_i)
+                                    await _blocking_call(_maybe_degrade, db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
@@ -2869,13 +2915,13 @@ async def responses_proxy(
                                 latency_ms = int((time.perf_counter() - request_start) * 1000)
                                 seq = _log_chat_row(None, latency_ms, final_model, "resp", final_uid,
                                                     200, None, error_kind=kind)
-                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request), use_case="responses",
                                               seq=seq, latency_ms=latency_ms, error_kind=kind)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
-                                _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:65536], model=m,
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, _raw_text[:65536], model=m,
                                                           reset_at=_error_reset_at(r.headers, _raw_text))
                                 return
                             if pending_events:
@@ -2889,7 +2935,7 @@ async def responses_proxy(
                             text = "\n".join(raw_lines)
                             # 健康响应才清空连败计数并更新「最近使用」。
                             acc_i.last_used_at = datetime.utcnow()
-                            _note_success(db2, acc_i)
+                            await _blocking_call(_note_success, db2, acc_i)
                             usage = _parse_usage(text)
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
@@ -2901,7 +2947,7 @@ async def responses_proxy(
                                 POOL.sticky.bind(sticky_key, held_uid)
                             POOL.release(held_uid)
                             held_uid = ""
-                            _record_usage(key.id, final_acc_id, final_model, usage["credits"], updated,
+                            await _blocking_call(_record_usage, key.id, final_acc_id, final_model, usage["credits"], updated,
                                           client_ip=_client_ip(request), use_case="responses",
                                           prompt_tokens=usage["prompt_tokens"],
                                           completion_tokens=usage["completion_tokens"],
@@ -2917,8 +2963,8 @@ async def responses_proxy(
                                 held_uid = ""
                                 return
                             kind = _classify_error(0, _exc_text(e))
-                            _apply_account_policy(db2, acc_i, kind, 0, _exc_text(e), model=m)
-                            _maybe_degrade(db2, acc_i)
+                            await _blocking_call(_apply_account_policy, db2, acc_i, kind, 0, _exc_text(e), model=m)
+                            await _blocking_call(_maybe_degrade, db2, acc_i)
                             last_err_kind = kind
                             last_err_msg = _exc_text(e)
                             sess_i.close()
@@ -2930,7 +2976,7 @@ async def responses_proxy(
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             err_kind = last_err_kind or "no_account"
             seq = _log_chat_row(None, latency_ms, final_model, "resp", "-", 503, None, error_kind=err_kind)
-            _record_usage(key.id, 0, final_model, 0.0, None,
+            await _blocking_call(_record_usage, key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="responses", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
             if err_kind == "waf":
@@ -2945,9 +2991,9 @@ async def responses_proxy(
                 POOL.release(held_uid)
             if sess_i is not None:
                 sess_i.close()
-            db2.close()
+            await _blocking_call(db2.close)
 
-    return StreamingResponse(_stream(), media_type="text/event-stream",
+    return StreamingResponse(_client_stream(_stream()), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
@@ -2968,6 +3014,7 @@ async def anthropic_messages(
     模型名：claude-opus-* / claude-sonnet-* / claude-haiku-* 按档次映射到白名单
     里的模型（见 _map_anthropic_model），也允许直接传 glm-5.2 这类上游模型名。
     """
+    request_start = time.perf_counter()
     if not _ANTHROPIC_AVAILABLE:
         return JSONResponse(status_code=501,
                             content={"error": {"message": "Anthropic 适配器未加载", "type": "not_supported"}})
@@ -2977,7 +3024,7 @@ async def anthropic_messages(
         api_key = authorization[7:].strip()
     if not api_key:
         return JSONResponse(status_code=401, content={"error": {"message": "缺少 API Key", "type": "auth_error"}})
-    key = get_key_row(db, api_key)
+    key = await _blocking_call(get_key_row, db, api_key)
     if not key:
         return JSONResponse(status_code=401, content={"error": {"message": "无效 API Key", "type": "auth_error"}})
     try:
@@ -2986,7 +3033,7 @@ async def anthropic_messages(
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
     try:
-        payload = await request.json()
+        payload = await _request_json(request)
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
@@ -3024,8 +3071,8 @@ async def anthropic_messages(
         except Exception as e:
             _logger.warning("harness 脱敏失败，按原样发送：%s", e)
 
-    requested = _map_anthropic_model(db, payload.get("model", "auto"), key)
-    allowed = _key_group_models(db, key)
+    requested = await _blocking_call(_map_anthropic_model, db, payload.get("model", "auto"), key)
+    allowed = await _blocking_call(_key_group_models, db, key)
     resolved = await _blocking_call(_pick_best_model, db, requested, allowed)
     if resolved is None:
         if allowed is not None and requested not in ("auto", ""):
@@ -3035,7 +3082,7 @@ async def anthropic_messages(
 
     order = [resolved]
     if requested in ("auto", ""):
-        order = ([resolved] + _candidate_models(db, {resolved}, allowed))[:8]
+        order = ([resolved] + await _blocking_call(_candidate_models, db, {resolved}, allowed))[:8]
 
     # 上游一律按流式拉取：Anthropic 的方向就是「消费 Chat SSE 再转事件流」。
     # 客户端若要非流式，我们在内部聚合完再一次性返回。
@@ -3077,7 +3124,7 @@ async def anthropic_messages(
                         break
                     if not retry_budget.available():
                         break
-                    acc_i = _select_account(db2, exclude_ids=tried_ids, min_balance=1,
+                    acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
                                             model=m, sticky_key=sticky_key)
                     if not acc_i:
                         break
@@ -3091,21 +3138,21 @@ async def anthropic_messages(
                         POOL.release(held_uid)
                         held_uid = ""
                         continue
-                    extra_i = _upstream_extra_headers(request)
+                    extra_i = await _blocking_call(_upstream_extra_headers, request)
                     extra_i.update(session_hdr)
                     if acc_i.uid:
                         extra_i["X-Machine-ID"] = backend.stable_device_id(acc_i.uid, "machine")
                         extra_i["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
-                    headers_i = sess_i.get_headers(extra=extra_i)
+                    headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra_i)
                     try:
-                        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=backend.HTTP_LIMITS) as client:
+                        async with upstream_http.client(request, _stream_timeout(), backend.HTTP_LIMITS) as client:
                             r = await client.post(url, headers=headers_i, json=body)
                             if r.status_code >= 400:
                                 text = r.text[:65536]
                                 kind = _classify_error(r.status_code, text)
-                                _apply_account_policy(db2, acc_i, kind, r.status_code, text,
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                       model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
-                                _maybe_degrade(db2, acc_i)
+                                await _blocking_call(_maybe_degrade, db2, acc_i)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -3122,9 +3169,9 @@ async def anthropic_messages(
                             # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：同样换号。
                             if _looks_like_inband_error(r.text) or _sse_has_error_event(r.text):
                                 kind = _classify_error(200, r.text)
-                                _apply_account_policy(db2, acc_i, kind, 200, r.text[:65536], model=m,
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, r.text[:65536], model=m,
                                                       reset_at=_error_reset_at(r.headers, r.text))
-                                _maybe_degrade(db2, acc_i)
+                                await _blocking_call(_maybe_degrade, db2, acc_i)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -3151,7 +3198,7 @@ async def anthropic_messages(
                             msg_obj = conv.build_message()
                             cost_info = _parse_usage("\n".join(raw_lines))
                             acc_i.last_used_at = datetime.utcnow()
-                            _note_success(db2, acc_i)  # 成功清零连败计数
+                            await _blocking_call(_note_success, db2, acc_i)  # 成功清零连败计数
                             updated = sess_i.updated_json()
                             total_toks = cost_info["total_tokens"] or cost_info["completion_tokens"]
                             seq = _log_chat_row(None, None, m, "anthropic", acc_i.uid or "-", 200,
@@ -3161,7 +3208,7 @@ async def anthropic_messages(
                                 POOL.sticky.bind(sticky_key, held_uid)
                             POOL.release(held_uid)
                             held_uid = ""
-                            _record_usage(key.id, acc_i.id, m, cost_info["credits"], updated,
+                            await _blocking_call(_record_usage, key.id, acc_i.id, m, cost_info["credits"], updated,
                                           client_ip=_client_ip(request), use_case="anthropic",
                                           prompt_tokens=cost_info["prompt_tokens"],
                                           completion_tokens=cost_info["completion_tokens"],
@@ -3171,8 +3218,8 @@ async def anthropic_messages(
                             return JSONResponse(content=msg_obj)
                     except Exception as e:
                         kind = _classify_error(0, _exc_text(e))
-                        _apply_account_policy(db2, acc_i, kind, 0, _exc_text(e), model=m)
-                        _maybe_degrade(db2, acc_i)
+                        await _blocking_call(_apply_account_policy, db2, acc_i, kind, 0, _exc_text(e), model=m)
+                        await _blocking_call(_maybe_degrade, db2, acc_i)
                         sess_i.close()
                         POOL.release(held_uid)
                         held_uid = ""
@@ -3180,7 +3227,7 @@ async def anthropic_messages(
                         rotate_idx += 1
                         continue
             seq = _log_chat_row(None, None, resolved, "anthropic", "-", 503, None, error_kind="no_account")
-            _record_usage(key.id, 0, resolved, 0.0, None,
+            await _blocking_call(_record_usage, key.id, 0, resolved, 0.0, None,
                           client_ip=_client_ip(request), use_case="anthropic",
                           seq=seq, error_kind="no_account")
             if POOL.waf.active():
@@ -3196,7 +3243,7 @@ async def anthropic_messages(
                 POOL.release(held_uid)
             if sess_i is not None:
                 sess_i.close()
-            db2.close()
+            await _blocking_call(db2.close)
 
 
     async def _stream():
@@ -3204,7 +3251,6 @@ async def anthropic_messages(
         held_uid = ""
         sess_i = None
         try:
-            request_start = time.perf_counter()
             ttfb_at = None
             seq = None
             final_model = resolved
@@ -3219,7 +3265,7 @@ async def anthropic_messages(
                                            getattr(settings, "RETRY_WINDOW_SECONDS", 90))
             rotate_idx = 0
 
-            async with httpx.AsyncClient(timeout=_stream_timeout(), limits=backend.HTTP_LIMITS) as client:
+            async with upstream_http.client(request, _stream_timeout(), backend.HTTP_LIMITS) as client:
                 for m in order:
                     if not retry_budget.available():
                         break
@@ -3233,7 +3279,7 @@ async def anthropic_messages(
                             break
                         if not retry_budget.available():
                             break
-                        acc_i = _select_account(db2, exclude_ids=tried_ids, min_balance=1,
+                        acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
                                                 model=m, sticky_key=sticky_key)
                         if not acc_i:
                             break
@@ -3247,12 +3293,12 @@ async def anthropic_messages(
                             POOL.release(held_uid)
                             held_uid = ""
                             continue
-                        extra_i = _upstream_extra_headers(request)
+                        extra_i = await _blocking_call(_upstream_extra_headers, request)
                         extra_i.update(session_hdr)
                         if acc_i.uid:
                             extra_i["X-Machine-ID"] = backend.stable_device_id(acc_i.uid, "machine")
                             extra_i["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
-                        headers_i = sess_i.get_headers(extra=extra_i)
+                        headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra_i)
                         raw_lines.clear()
                         delivered = False
                         pending_events = []
@@ -3263,9 +3309,9 @@ async def anthropic_messages(
                                     detail = await r.aread()
                                     text = detail[:65536].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:65536]
                                     kind = _classify_error(r.status_code, text)
-                                    _apply_account_policy(db2, acc_i, kind, r.status_code, text,
+                                    await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                           model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
-                                    _maybe_degrade(db2, acc_i)
+                                    await _blocking_call(_maybe_degrade, db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
@@ -3287,8 +3333,6 @@ async def anthropic_messages(
                                 async for line in r.aiter_lines():
                                     if not line.strip():
                                         continue
-                                    if ttfb_at is None:
-                                        ttfb_at = time.perf_counter()
                                     raw_lines.append(line)
                                     if not delivered and (_looks_like_inband_error(line) or _sse_has_error_event(line)):
                                         break
@@ -3298,6 +3342,7 @@ async def anthropic_messages(
                                     if delivered or _sse_has_content(line) or _sse_has_finish_reason(line):
                                         if pending_events:
                                             delivered = True
+                                            ttfb_at = ttfb_at or time.perf_counter()
                                             yield "".join(pending_events)
                                             pending_events.clear()
                             # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：
@@ -3306,9 +3351,9 @@ async def anthropic_messages(
                             if (_looks_like_inband_error(_raw_text) or _sse_has_error_event(_raw_text)):
                                 kind = _classify_error(200, _raw_text)
                                 if not delivered:
-                                    _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:65536], model=m,
+                                    await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, _raw_text[:65536], model=m,
                                                           reset_at=_error_reset_at(r.headers, _raw_text))
-                                    _maybe_degrade(db2, acc_i)
+                                    await _blocking_call(_maybe_degrade, db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
@@ -3329,13 +3374,13 @@ async def anthropic_messages(
                                 latency_ms = int((time.perf_counter() - request_start) * 1000)
                                 seq = _log_chat_row(None, latency_ms, final_model, "anthropic",
                                                     final_uid, 200, None, error_kind=kind)
-                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request), use_case="anthropic",
                                               seq=seq, latency_ms=latency_ms, error_kind=kind)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
-                                _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:65536], model=m,
+                                await _blocking_call(_apply_account_policy, db2, acc_i, kind, 200, _raw_text[:65536], model=m,
                                                           reset_at=_error_reset_at(r.headers, _raw_text))
                                 return
                             if pending_events:
@@ -3348,7 +3393,7 @@ async def anthropic_messages(
                             text = "\n".join(raw_lines)
                             # 健康响应才清空连败计数并更新「最近使用」。
                             acc_i.last_used_at = datetime.utcnow()
-                            _note_success(db2, acc_i)
+                            await _blocking_call(_note_success, db2, acc_i)
                             usage = _parse_usage(text)
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
@@ -3361,7 +3406,7 @@ async def anthropic_messages(
                                 POOL.sticky.bind(sticky_key, held_uid)
                             POOL.release(held_uid)
                             held_uid = ""
-                            _record_usage(key.id, final_acc_id, final_model, usage["credits"], updated,
+                            await _blocking_call(_record_usage, key.id, final_acc_id, final_model, usage["credits"], updated,
                                           client_ip=_client_ip(request), use_case="anthropic",
                                           prompt_tokens=usage["prompt_tokens"],
                                           completion_tokens=usage["completion_tokens"],
@@ -3377,8 +3422,8 @@ async def anthropic_messages(
                                 held_uid = ""
                                 return
                             kind = _classify_error(0, _exc_text(e))
-                            _apply_account_policy(db2, acc_i, kind, 0, _exc_text(e), model=m)
-                            _maybe_degrade(db2, acc_i)
+                            await _blocking_call(_apply_account_policy, db2, acc_i, kind, 0, _exc_text(e), model=m)
+                            await _blocking_call(_maybe_degrade, db2, acc_i)
                             last_err_kind = kind
                             last_err_msg = _exc_text(e)
                             sess_i.close()
@@ -3390,7 +3435,7 @@ async def anthropic_messages(
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             err_kind = last_err_kind or "no_account"
             seq = _log_chat_row(None, latency_ms, final_model, "anthropic", "-", 503, None, error_kind=err_kind)
-            _record_usage(key.id, 0, final_model, 0.0, None,
+            await _blocking_call(_record_usage, key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="anthropic",
                           seq=seq, latency_ms=latency_ms, error_kind=err_kind)
             if err_kind == "waf":
@@ -3403,9 +3448,9 @@ async def anthropic_messages(
                 POOL.release(held_uid)
             if sess_i is not None:
                 sess_i.close()
-            db2.close()
+            await _blocking_call(db2.close)
 
-    return StreamingResponse(_stream(), media_type="text/event-stream",
+    return StreamingResponse(_client_stream(_stream()), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
@@ -3427,11 +3472,11 @@ async def anthropic_count_tokens(
         api_key = authorization[7:].strip()
     if not api_key:
         return JSONResponse(status_code=401, content={"error": {"message": "缺少 API Key", "type": "auth_error"}})
-    if not get_key_row(db, api_key):
+    if not await _blocking_call(get_key_row, db, api_key):
         return JSONResponse(status_code=401, content={"error": {"message": "无效 API Key", "type": "auth_error"}})
 
     try:
-        payload = await request.json()
+        payload = await _request_json(request)
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
@@ -3485,6 +3530,17 @@ def models(
                                                "type": "no_account"}})
     # 绑定了分组的 Key 只应看到组内模型，否则客户端会照着完整列表点模型然后被 403
     allowed = _key_group_models(db, key)
+    configs = db.query(ModelConfig).all()
+    enabled_ids = {row.model_id for row in configs if row.enabled}
+    if os.getenv("WORKBUDDY_ANDROID") == "1":
+        # Reuse the local model rules also displayed in the admin model screen.
+        if configs:
+            data = [{'id': row.model_id, 'object': 'model', 'owned_by': 'codebuddy',
+                     'name': row.note or row.model_id,
+                     'credit_multiplier': row.credit_multiplier}
+                    for row in configs if row.enabled and
+                    (allowed is None or row.model_id in allowed)]
+            return {'object': 'list', 'data': data, 'source': 'local'}
     # 换号重试 + 错误处置，与对话端点同口径。
     #
     # 原实现只选**一次**账号，失败就直接 502 —— 既不做 `_apply_account_policy`
@@ -3502,9 +3558,13 @@ def models(
         if acc is None:
             break
         try:
-            with backend.AccountSession(acc.auth_json) as sess:
-                models_raw = sess.fetch_models()
-                acc.auth_json = sess.updated_json()
+            def fetch():
+                with backend.AccountSession(acc.auth_json) as sess:
+                    models_raw = sess.fetch_models()
+                    acc.auth_json = sess.updated_json()
+                return models_raw
+            with request_metrics.measure('models_catalog'):
+                models_raw = model_catalog.get_models(acc.auth_json, settings.BACKEND, fetch)
             acc.last_used_at = datetime.utcnow()
             # 注意参数顺序是 (db, acc) —— 写反了会把 Session 当账号用，
             # 报 "'Session' object has no attribute 'breaker_fails'"，而且因为
@@ -3521,7 +3581,8 @@ def models(
             } for m in models_raw
                 if m.get("id")
                 and m.get("id", "").lower() != "auto"
-                and (m.get("id") in allowed if allowed is not None else _is_model_allowed(db, m.get("id")))]
+                and (m.get("id") in allowed if allowed is not None else
+                     not enabled_ids or m.get("id") in enabled_ids)]
             return {"object": "list", "data": data, "source": "backend"}
         except Exception as e:
             last_err = str(e)
@@ -3534,6 +3595,9 @@ def models(
             except Exception:
                 db.rollback()
             tried_ids.add(acc.id)
+            if os.getenv("WORKBUDDY_ANDROID") == "1" and kind == "transport":
+                # The same unreachable network will not improve by switching accounts.
+                break
             if attempt + 1 >= max_try:
                 acc = None
                 break

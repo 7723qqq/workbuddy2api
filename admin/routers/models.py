@@ -10,7 +10,7 @@ import json
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -238,6 +238,7 @@ _SPEED_TEST_PROMPT = [{"role": "user", "content": "用一句话介绍一下你�
 @router.post("/speed-test")
 async def speed_test(
     body: dict,
+    request: Request,
     _: bool = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -270,8 +271,14 @@ async def speed_test(
                     f"但没有任何「启用且余额大于 0」的账号"
                     f"（本接口不判断在途与冷却状态）"))
 
+    from admin.routers.proxy import _blocking_call
+    from admin import upstream_http
     sess = backend.AccountSession(acc.auth_json)
-    headers = sess.get_headers()
+    try:
+        headers = await _blocking_call(sess.get_headers)
+    except BaseException:
+        sess.close()
+        raise
     url = f"{settings.BACKEND}/v2/chat/completions"
     payload = {
         "model": model,
@@ -297,12 +304,12 @@ async def speed_test(
             pass
 
     try:
-        async with httpx.AsyncClient(timeout=120, limits=backend.HTTP_LIMITS) as client:
+        async with upstream_http.client(request, 120, backend.HTTP_LIMITS) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
                 if r.status_code >= 400:
                     detail = await r.aread()
                     msg = detail.decode("utf-8", "replace")[:300]
-                    _persist()
+                    await _blocking_call(_persist)
                     sess.close()
                     raise HTTPException(status_code=r.status_code, detail=f"上游返回错误: {msg}")
                 async for chunk in r.aiter_text():
@@ -341,11 +348,11 @@ async def speed_test(
     except HTTPException:
         raise
     except Exception as e:
-        _persist()
+        await _blocking_call(_persist)
         sess.close()
         raise HTTPException(status_code=502, detail=f"测速请求失败: {e}")
 
-    _persist()
+    await _blocking_call(_persist)
     sess.close()
 
     total_dur = t_end - t0

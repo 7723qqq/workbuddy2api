@@ -1,6 +1,7 @@
 """Per-key sliding window and renewable Redis concurrency leases."""
 from collections import deque
 import asyncio
+import anyio
 import logging
 import math
 import uuid
@@ -151,7 +152,12 @@ async def _finish_thread(fn, *args):
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        await task
+        with anyio.CancelScope(shield=True):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
         raise
 
 
@@ -176,9 +182,15 @@ class GatewayAdmissionMiddleware:
         try:
             result = await asyncio.shield(pending)
         except asyncio.CancelledError:
-            result = await pending
-            if not isinstance(result, tuple):
-                await _finish_thread(release, result)
+            with anyio.CancelScope(shield=True):
+                while not pending.done():
+                    try:
+                        await asyncio.shield(pending)
+                    except asyncio.CancelledError:
+                        continue
+                result = pending.result()
+                if not isinstance(result, tuple):
+                    await _finish_thread(release, result)
             raise
         except Exception:
             return await JSONResponse({'error': {'message': '流量控制服务暂不可用', 'type': 'gateway_unavailable'}},

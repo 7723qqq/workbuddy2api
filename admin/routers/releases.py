@@ -19,6 +19,14 @@ def version():
     return {"version": VERSION, "releases_url": RELEASES_URL}
 
 
+@router.get("/request-timings", dependencies=[Depends(require_admin)])
+def request_timings():
+    if os.getenv("WORKBUDDY_ANDROID") != "1":
+        raise HTTPException(status_code=404)
+    from admin.request_metrics import snapshot
+    return snapshot()
+
+
 @router.get("/icon")
 def icon():
     return FileResponse(ROOT / "desktop/assets/app.svg", media_type="image/svg+xml")

@@ -839,27 +839,27 @@
     <!-- Key 面板 -->
     <section id="panel-keys" class="hidden">
       <!-- 对外对接信息：把系统接口 / 模型列表 / baseurl 放出来，方便把 Key 共享给他人 -->
-      <div class="card p-4 mb-3">
+      <div class="card p-4 mb-3 api-share-card">
         <div class="flex items-center justify-between mb-2">
           <h3 class="text-sm font-semibold text-wb"><i class="fa-solid fa-plug mr-1"></i> 对外对接信息（共享用）</h3>
           <button onclick="loadShareInfo()" class="text-xs text-slate-400 hover-brand"><i class="fa-solid fa-rotate mr-1"></i>刷新</button>
         </div>
-        <div class="grid gap-2 text-sm">
-          <div class="flex items-center gap-2 flex-wrap">
+        <div class="grid gap-2 text-sm api-share-grid">
+          <div class="flex items-center gap-2 flex-wrap api-share-row">
             <span class="text-slate-400 w-32 shrink-0">Base URL <span class="text-[10px] text-slate-300">OpenAI</span></span>
             <code id="shareBaseUrl" class="flex-1 min-w-0 truncate rounded bg-slate-50 px-2 py-1 font-mono text-xs"></code>
             <button onclick="copyText('#shareBaseUrl')" class="px-2 py-1 rounded border text-xs shrink-0" title="复制"><i class="fa-solid fa-copy"></i></button>
           </div>
-          <div class="flex items-center gap-2 flex-wrap">
+          <div class="flex items-center gap-2 flex-wrap api-share-row">
             <span class="text-slate-400 w-32 shrink-0">Base URL <span class="text-[10px] text-slate-300">Claude</span></span>
             <code id="shareBaseUrlClaude" class="flex-1 min-w-0 truncate rounded bg-slate-50 px-2 py-1 font-mono text-xs"></code>
             <button onclick="copyText('#shareBaseUrlClaude')" class="px-2 py-1 rounded border text-xs shrink-0" title="复制"><i class="fa-solid fa-copy"></i></button>
           </div>
-          <div class="flex items-center gap-2 flex-wrap">
+          <div class="flex items-center gap-2 flex-wrap api-share-row">
             <span class="text-slate-400 w-32 shrink-0">鉴权</span>
             <code class="flex-1 min-w-0 truncate rounded bg-slate-50 px-2 py-1 font-mono text-xs">Authorization: Bearer &lt;你的 Key&gt; &nbsp;或&nbsp; x-api-key: &lt;你的 Key&gt;</code>
           </div>
-          <div class="text-[11px] text-slate-400 leading-relaxed rounded bg-slate-50 px-2 py-1.5">
+          <div class="text-[11px] text-slate-400 leading-relaxed rounded bg-slate-50 px-2 py-1.5 api-share-help">
             OpenAI 与 Anthropic 两套协议<b>共用同一批 Key、同一套配额与用量记账</b>，只是 base_url 约定不同：
             OpenAI SDK 填上面那个（含 <code class="font-mono">/v1</code>），
             Claude Code / Anthropic SDK 填下面那个（<b>不含</b> <code class="font-mono">/v1</code>，SDK 会自己拼 <code class="font-mono">/v1/messages</code>，填错会变成 <code class="font-mono">/v1/v1/messages</code>）。
@@ -1665,6 +1665,7 @@ function _tabFromUrl() {
  */
 function activateTab(name, opts) {
   if (!TABS.includes(name)) name = TAB_DEFAULT;
+  document.documentElement.dataset.activeTab = name;
   // 侧栏导航：active 由 .side-item.active 表达
   document.querySelectorAll(".side-item").forEach(x => {
     x.classList.toggle("active", x.dataset.tab === name);
@@ -3425,9 +3426,24 @@ function openPhoneLogin(){
       <div class="flex justify-center gap-2 mt-4">
         <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
       </div>
+    </div>
+    <div class="phone-login-footer">
+      <a href="/join" target="_blank" rel="noopener noreferrer" onclick="watchJoinAuthorization()"><i class="fa-solid fa-arrow-up-right-from-square mr-1" aria-hidden="true"></i>授权页面</a>
+      <span>在浏览器完成授权后自动加入账号池</span>
     </div>`, "max-w-md");
   setTimeout(() => { const el = $("#plMobile"); if(el) el.focus(); }, 60);
 }
+
+let _joinRefreshPending = false;
+function watchJoinAuthorization(){ _joinRefreshPending = true; }
+function refreshAfterJoin(){
+  if(!_joinRefreshPending || document.visibilityState === "hidden") return;
+  _joinRefreshPending = false;
+  loadAccounts();
+}
+window.addEventListener("focus", refreshAfterJoin);
+window.addEventListener("wb-shell-resume", refreshAfterJoin);
+document.addEventListener("visibilitychange", refreshAfterJoin);
 
 /* 发起会话（拿 sid）。发码前必须先有 sid —— 整条授权链绑定在它上面。 */
 async function plStart(){
@@ -4989,7 +5005,7 @@ function logRow(l) {
   const ttfbS = l.ttfb_ms!=null ? (l.ttfb_ms/1000).toFixed(2)+'s' : '—';
   const latencyHtml = l.ttfb_ms!=null || l.latency_ms!=null
     ? `<div class="leading-tight text-[11px] tnum">
-         <div class="flex items-center gap-1"><span class="w-7" style="color:var(--fg-subtle)">首字</span><span class="font-medium" style="color:${ttfbColor(l.ttfb_ms)}">${ttfbS}</span></div>
+         <div class="flex items-center gap-1"><span style="color:var(--fg-subtle)" title="从收到请求到首次转发正文、思考或工具增量；最终答案可能更晚出现">首响应</span><span class="font-medium" style="color:${ttfbColor(l.ttfb_ms)}">${ttfbS}</span></div>
          <div class="flex items-center gap-1 mt-0.5"><span class="w-7" style="color:var(--fg-subtle)">总</span>
            <div class="pkg-track" style="width:48px;margin:0"><i style="width:${latencyBar(l.latency_ms)}%;background:${totalColor(l.latency_ms)}"></i></div>
            <span class="font-medium" style="color:${totalColor(l.latency_ms)}">${latS}</span></div>

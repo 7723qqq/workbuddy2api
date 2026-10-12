@@ -12,6 +12,8 @@
 
 **Windows 桌面版**：下载 [Releases](https://github.com/xiaofan6ya/workbuddy2api/releases) 中的 EXE，双击直接进入，无需配置 Python、MySQL 或后台登录。内置项目依赖，自动准备 Node/WebView2，支持检查更新与选择升级。构建、数据目录与发布说明见 [desktop/README.md](desktop/README.md)。
 
+**Android 本地版**：在 ARM64 手机上独立运行 Python 后端与 SQLite，通过手机号登录或浏览器 `/join` 授权添加账号。同机 API 地址默认 `http://127.0.0.1:8790/v1`，不包含扫描本机、客户端参数页面或拆包工具。构建与后台运行说明见 [android/README.md](android/README.md)。
+
 ## 它是什么
 
 `workbuddy2api` 不负责登录、不模拟桌面端、不替你执行工具。对外它提供两类能力：

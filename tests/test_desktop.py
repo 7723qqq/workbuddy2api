@@ -137,7 +137,8 @@ class FreshBackendTests(unittest.TestCase):
                     env.pop(key)
             output = (base / "test.log").open("wb")
             process = subprocess.Popen([sys.executable, str(ROOT / "desktop_entry.py"), "--backend", str(port)],
-                                       env=env, stdout=output, stderr=output)
+                                       env=env, stdout=output, stderr=output,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             try:
                 url = f"http://127.0.0.1:{port}"
                 for _ in range(100):
