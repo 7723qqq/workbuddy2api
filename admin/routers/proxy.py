@@ -27,6 +27,7 @@ from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, Usa
 from admin.routers.models import _is_model_allowed
 from admin.security import check_quota, get_key_row
 from admin.pool import POOL
+from upstream_compat import normalize_tool_choice
 
 HTTP_LIMITS = backend.HTTP_LIMITS
 
@@ -2995,6 +2996,7 @@ async def anthropic_messages(
 
     try:
         chat_body = anthropic_request_to_chat(payload)
+        normalize_tool_choice(chat_body)
     except Exception as e:
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"请求转换失败：{e}", "type": "invalid_request"}})

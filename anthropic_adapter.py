@@ -71,7 +71,13 @@ def anthropic_request_to_chat(body: dict) -> dict:
     if "tool_choice" in body:
         tc = body["tool_choice"]
         if isinstance(tc, dict):
-            chat["tool_choice"] = {"type": tc.get("type", "any"), "function": {"name": tc.get("name", "")}}
+            choice_type = tc.get("type", "any")
+            if choice_type in ("auto", "any", "none"):
+                chat["tool_choice"] = "required" if choice_type == "any" else choice_type
+            elif choice_type == "tool":
+                chat["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+            else:
+                chat["tool_choice"] = dict(tc)
         elif isinstance(tc, str):
             chat["tool_choice"] = tc if tc in ("none", "auto", "required") else {"type": "function", "function": {"name": tc}}
 
@@ -117,6 +123,30 @@ def _extract_system_text(system) -> str:
     return ""
 
 
+def _image_block_to_chat_part(block: dict) -> dict:
+    """Preserve Anthropic base64/URL images; reject invalid sources instead of losing them."""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("image.source must be an object")
+    source_type = source.get("type")
+    if source_type == "base64":
+        media = source.get("media_type") or "image/png"
+        data = source.get("data")
+        if not isinstance(media, str) or not media.strip().startswith("image/"):
+            raise ValueError("image.source.media_type must be an image MIME type")
+        if not isinstance(data, str) or not data.strip():
+            raise ValueError("image.source.data must be a nonempty base64 string")
+        url = f"data:{media.strip()};base64,{data.strip()}"
+    elif source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("image.source.url must be a nonempty string")
+        url = url.strip()
+    else:
+        raise ValueError("image.source.type must be base64 or url")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def _convert_anthropic_message(msg: dict) -> list[dict]:
     """将单个 Anthropic 消息转换为 OpenAI 格式的消息（可能为多条）。"""
     role = msg.get("role", "")
@@ -136,13 +166,17 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 检查是否包含 tool_result（role=user 时）
     if role == "user":
         result: list[dict] = []
-        text_parts: list[str] = []
+        content_parts: list[dict] = []
+        has_images = False
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
             if bt == "text":
-                text_parts.append(block.get("text", ""))
+                content_parts.append({"type": "text", "text": block.get("text", "")})
+            elif bt == "image":
+                content_parts.append(_image_block_to_chat_part(block))
+                has_images = True
             elif bt == "tool_result":
                 # tool_result → 独立的 tool 消息
                 tc_id = block.get("tool_use_id", "")
@@ -152,8 +186,9 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                         b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
                     )
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-        if text_parts:
-            result.insert(0, {"role": "user", "content": "".join(text_parts)})
+        if content_parts:
+            content = content_parts if has_images else "".join(part["text"] for part in content_parts)
+            result.insert(0, {"role": "user", "content": content})
         return result
 
     # assistant 角色

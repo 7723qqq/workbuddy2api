@@ -1410,9 +1410,12 @@ async def create_message(request: Request,
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
     chat_body.setdefault("model", "auto")
-    chat_body["stream"] = True
-    if "stream_options" not in chat_body:
-        chat_body["stream_options"] = {"include_usage": True}
+    supported = _supported_efforts_for(cred, chat_body.get("model"))
+    upstream_compat.prepare_upstream_body(
+        chat_body,
+        sanitize=bool(CONFIG.get("desensitize")),
+        supported_efforts=supported,
+    )
 
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(chat_body, roles=("system", "developer"),

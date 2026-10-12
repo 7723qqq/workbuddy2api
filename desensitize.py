@@ -327,6 +327,11 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
 
 def _compact_harness_message(role: str, content) -> str | None:
     """把 Codex / Claude Code 注入的超长运行时提示压缩成短摘要，降低审核误伤。"""
+    # A text summary cannot represent attachments; keep multimodal blocks intact.
+    if isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") != "text" for block in content
+    ):
+        return None
     text = _content_to_text(content)
     if not text:
         return None
