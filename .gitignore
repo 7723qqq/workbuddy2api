@@ -79,3 +79,15 @@ scripts/*.py
 _zcode_probe/
 _chrome_profile*/
 
+# Desktop build outputs (never package local credentials or databases)
+.desktop-build/
+build/
+dist/
+desktop/assets/*.ico
+desktop/assets/*.png
+
+!scripts/build_desktop.py
+!tests/
+tests/*
+!tests/test_desktop.py
+

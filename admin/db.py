@@ -3,7 +3,7 @@ import logging
 import re
 import time
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from admin.config import settings
@@ -26,6 +26,12 @@ def _quote_db_name(name: str) -> str:
 
 engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True, pool_recycle=3600,
                         pool_timeout=30, pool_size=20, max_overflow=40, future=True)
+if engine.dialect.name == "sqlite":
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(connection, _record):
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA synchronous=NORMAL")
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 Base = declarative_base()
 
@@ -193,6 +199,13 @@ def wait_database_ready() -> bool:
 def _ensure_column(table: str, col: str, col_type: str, default: str = ""):
     """检查并添加缺失的列（MySQL 兼容）。表名/列名经白名单校验；其余参数走绑定。"""
     try:
+        if engine.dialect.name == "sqlite":
+            exists = any(c["name"] == col for c in inspect(engine).get_columns(table))
+            if not exists:
+                with engine.begin() as conn:
+                    conn.execute(text(f'ALTER TABLE "{_safe_ident(table)}" '
+                                      f'ADD COLUMN "{_safe_ident(col)}" {col_type} {default}'))
+            return
         with engine.connect() as conn:
             result = conn.execute(
                 text(
@@ -228,6 +241,12 @@ def _ensure_index(table: str, index: str, columns: tuple[str, ...]) -> bool:
     if not columns:
         return False
     try:
+        if engine.dialect.name == "sqlite":
+            with engine.begin() as conn:
+                cols = ", ".join(f'"{_safe_ident(c)}"' for c in columns)
+                conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{_safe_ident(index)}" '
+                                  f'ON "{_safe_ident(table)}" ({cols})'))
+            return True
         with engine.connect() as conn:
             exists = conn.execute(
                 text(

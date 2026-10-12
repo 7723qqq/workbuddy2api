@@ -23,6 +23,7 @@ from admin.security import (
     verify_password,
 )
 from admin.gateway_limits import GatewayAdmissionMiddleware
+from admin.routers import releases
 
 logger = logging.getLogger("admin.server")
 
@@ -117,6 +118,7 @@ app.include_router(growth.router)
 app.include_router(client_profile.router)
 app.include_router(app_source.router)
 app.include_router(login_router.router)
+app.include_router(releases.router)
 # 自助上传页（无需后台登录态）：复刻 WorkBuddy 手机号登录页，
 # 让「发给朋友」这一诉求成立 —— 对方不需要知道后台口令。
 app.include_router(login_router.public_router)

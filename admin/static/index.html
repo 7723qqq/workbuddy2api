@@ -680,8 +680,12 @@
     input:focus,select:focus,textarea:focus{ border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-soft); }
   </style>
   <link rel="stylesheet" href="/static/console.css" />
+  <link rel="icon" href="/api/app/icon" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/desktop.css" />
+  <script>if(new URLSearchParams(location.search).get('desktop')==='1') document.documentElement.classList.add('desktop-mode');</script>
 </head>
 <body>
+<div id="localBoot"><img src="/api/app/icon" alt=""/><p id="localBootStatus">正在打开本地工作台…</p><button type="button" onclick="WBDesktop.retryLocal()">重新连接</button></div>
 
 <!-- 登录 -->
 <div id="login" class="min-h-screen flex items-center justify-center bg-wb">
@@ -714,9 +718,7 @@
         <i class="fa-solid fa-bars"></i>
       </button>
       <div class="side-brand">
-        <div class="w-9 h-9 rounded-xl bg-wb flex items-center justify-center shrink-0">
-          <i class="fa-solid fa-share-nodes text-white"></i>
-        </div>
+        <img src="/api/app/icon" alt="WorkBuddy2API" width="36" height="36" class="shrink-0" />
         <div class="min-w-0 side-title">
           <div class="fs-13-5 font-semibold leading-tight" style="letter-spacing:-.02em">WorkBuddy</div>
           <div class="text-[11px] leading-tight" style="color:var(--fg-subtle)">共享管理后台</div>
@@ -749,13 +751,22 @@
       </nav>
       <div class="side-foot">
         <div id="proxyUrl" class="truncate mb-1-5"></div>
-        <button onclick="logout()" class="hover-lift"><i class="fa-solid fa-right-from-bracket mr-1"></i>退出登录</button>
+        <button id="appVersion" class="version-button" onclick="WBDesktop.openUpdates()" title="检查更新与版本历史">v… · 检查更新</button>
+        <button onclick="logout()" class="hover-lift browser-logout"><i class="fa-solid fa-right-from-bracket mr-1"></i>退出登录</button>
       </div>
     </aside>
     <!-- 抽屉展开时的遮罩（点击收起） -->
     <div class="side-scrim" id="sideScrim" onclick="closeSideMenu()"></div>
 
     <main class="app-main">
+      <header class="desktop-topbar">
+        <div class="topbar-heading"><div class="topbar-breadcrumb">WorkBuddy <span>/</span> 工作台</div><h2 id="topbarTitle">账号池</h2></div>
+        <div class="topbar-actions">
+          <span class="topbar-status"><span></span><span id="topbarMode">服务已连接</span></span>
+          <button type="button" class="topbar-endpoint" onclick="navigator.clipboard.writeText(location.origin+'/v1').then(()=>{this.querySelector('span').textContent='已复制 API 地址';setTimeout(()=>this.querySelector('span').textContent='复制 API 地址',1800)})" title="复制当前 API 地址"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h11v11H9zM4 15H3V3h12v1"/></svg><span>复制 API 地址</span></button>
+          <button type="button" class="topbar-update" onclick="WBDesktop.openUpdates()" title="版本与更新" aria-label="版本与更新"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></svg></button>
+        </div>
+      </header>
       <div class="app-body">
         <section id="overview" class="stat-grid block-gap"></section>
 
@@ -1287,7 +1298,7 @@
     <!-- 设置面板 -->
     <section id="panel-settings" class="hidden">
       <h2 class="font-semibold mb-3">管理员设置</h2>
-      <div class="card p-5 max-w-md">
+      <div class="card p-5 max-w-md browser-password-settings">
         <h3 class="text-sm font-medium mb-3">修改登录密码</h3>
         <input id="oldPwd" type="password" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="当前密码" />
         <input id="newPwd" type="password" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="新密码（≥6 位）" />
@@ -1551,10 +1562,15 @@ function toast(msg, type = "ok") {
 }
 function openModal(html, widthClass) {
   const box = $("#modalBox");
-  // 只移除「上一次 openModal 设置的」宽度类，保留模板里的默认 max-w-6xl
-  box.classList.remove("max-w-6xl", "max-w-4xl", "max-w-3xl", "max-w-2xl");
+  // Reset every previous size, including the phone-login max-w-md class.
+  [...box.classList].filter(name => /^max-w-/.test(name)).forEach(name => box.classList.remove(name));
   box.classList.add(widthClass || "max-w-6xl");
-  box.innerHTML = html;
+  const sizes = {"max-w-sm":400,"max-w-md":480,"max-w-lg":640,"max-w-xl":720,
+    "max-w-2xl":800,"max-w-3xl":900,"max-w-4xl":1000,"max-w-6xl":1120};
+  box.style.setProperty("--modal-width", (sizes[widthClass] || 1120) + "px");
+  box.setAttribute("role", "dialog"); box.setAttribute("aria-modal", "true");
+  box.innerHTML = '<button type="button" class="modal-close-button" onclick="closeModal()" aria-label="关闭弹窗">×</button>' + html;
+  box.scrollTop = 0;
   $("#modal").classList.remove("hidden");
   $("#modal").classList.add("flex");
 }
@@ -2785,7 +2801,7 @@ async function viewCreditDetails(id, name, force){
       ? `<span class="exp-badge ever"><i class="fa-solid fa-clock-rotate-left"></i>本地快照</span>` : "";
 
     $("#creditDetailBody").innerHTML = `
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+      <div class="modal-stat-grid gap-3 mb-3">
         ${statCard("当前剩余", fmtCredit(c.total_remaining),
             { icon:"fa-wallet", iconColor:"text-slate-400", sub:`总额度 ${fmtCredit(c.total_capacity)}` })}
         ${statCard(`${c.expiring_soon_days || 7} 天内到期`, fmtCredit(soon),
@@ -5598,7 +5614,7 @@ document.addEventListener("mousemove", e => {
 
 // 启动：只有 401/403 才认定 token 失效；其它错误保留登录态，
 // 否则任何一个接口偶发 500 都会把用户踢回登录页（且清掉 token）。
-if (TOKEN) {
+if (TOKEN && !new URLSearchParams(location.search).has("desktop")) {
   api("/api/accounts").then(r => {
     if (r.ok) { enterApp(); return; }
     if (r.status === 401 || r.status === 403) { logout(); return; }
@@ -5612,5 +5628,6 @@ if (TOKEN) {
   });
 } else { /* 显示登录 */ }
 </script>
+<script src="/static/desktop.js"></script>
 </body>
 </html>

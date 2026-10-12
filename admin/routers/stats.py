@@ -148,7 +148,10 @@ def usage_stats(
     key_names = {k.id: k.name for k in db.query(ApiKey).all()}
 
     # ── 趋势（按天/按小时分桶）──────────────────────────────────────────
-    if granularity == "hour":
+    if db.get_bind().dialect.name == "sqlite":
+        bucket = func.strftime("%Y-%m-%d %H:00" if granularity == "hour" else "%Y-%m-%d",
+                               UsageLog.created_at)
+    elif granularity == "hour":
         bucket = func.date_format(UsageLog.created_at, "%Y-%m-%d %H:00")
     else:
         bucket = func.date_format(UsageLog.created_at, "%Y-%m-%d")

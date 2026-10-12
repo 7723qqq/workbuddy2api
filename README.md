@@ -10,6 +10,8 @@
 
 把 **WorkBuddy / CodeBuddy（腾讯代码助手）** 的桌面端登录态，转成你本机 / 局域网可直接使用的 **OpenAI / Anthropic 兼容 API**，并提供一个 **多账号代理共享 + 自动化运营平台**。
 
+**Windows 桌面版**：下载 [Releases](https://github.com/xiaofan6ya/workbuddy2api/releases) 中的 EXE，双击直接进入，无需配置 Python、MySQL 或后台登录。内置项目依赖，自动准备 Node/WebView2，支持检查更新与选择升级。构建、数据目录与发布说明见 [desktop/README.md](desktop/README.md)。
+
 ## 它是什么
 
 `workbuddy2api` 不负责登录、不模拟桌面端、不替你执行工具。对外它提供两类能力：

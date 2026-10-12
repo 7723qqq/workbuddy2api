@@ -16,7 +16,8 @@ from dotenv import load_dotenv
 # 加载项目根目录的 .env（无论运行时 CWD 在哪都能找到）。
 # 不会覆盖已经存在的系统环境变量（便于容器 / systemd 注入）。
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv(os.path.join(_ROOT, ".env"))
+if os.getenv("WORKBUDDY_DESKTOP") != "1":
+    load_dotenv(os.path.join(_ROOT, ".env"))
 
 _logger = logging.getLogger(__name__)
 
