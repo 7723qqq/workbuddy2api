@@ -469,12 +469,14 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
 
 
 def _gateway_fields(a: Account, now: datetime) -> dict:
-    until = max((t for t in (a.cool_until, a.breaker_until, a.degrade_until)
-                 if t and t > now), default=None)
+    states = [(a.cool_until, a.cool_kind or "cooling"),
+              (a.breaker_until, "breaker"), (a.degrade_until, "degraded")]
+    until, reason = max(((t, kind) for t, kind in states if t and t > now),
+                        default=(None, ""), key=lambda entry: entry[0])
     return {
         "gateway_state": "disabled" if a.status != "active" else "cooling" if until else "ready",
         "gateway_until": until.isoformat() + "Z" if until else None,
-        "gateway_reason": a.cool_kind or "breaker" if until else "",
+        "gateway_reason": reason,
     }
 
 
@@ -484,13 +486,23 @@ def _active_model_limits(db: Session, now: datetime) -> dict:
         # Old daily entries may have been stored as model_rate; report accurately.
         from admin.routers.proxy import _json_code, _MODEL_RATE_CODES
         daily = row.kind == "model_daily" or _json_code(row.reason or "") in _MODEL_RATE_CODES
+        from admin.model_limits import queue_retry_time
+        if (row.reason or "").startswith("[estimated]"):
+            source = "estimated"
+        elif daily and row.kind == "model_daily":
+            source = "upstream"
+        elif row.kind == "model_queue" and queue_retry_time(row.reason or "", now):
+            source = "queue_retry"
+        else:
+            source = "backoff"
         result.setdefault(row.account_id, []).append({
             "model": row.model,
             "kind": "model_daily" if daily else row.kind,
             "until": row.until.isoformat() + "Z",
             "remaining_seconds": max(0, int((row.until - now).total_seconds())),
-            "reset_source": "estimated" if (row.reason or "").startswith("[estimated]") else "upstream" if daily and row.kind == "model_daily" else "backoff",
+            "reset_source": source,
             "hits": row.hits or 0,
+            "upstream_code": _json_code(row.reason or ""),
         })
     return result
 

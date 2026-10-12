@@ -88,6 +88,17 @@ def list_configs(
     }
 
 
+@router.get("/busy")
+def model_busy(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """Upstream capacity is independent of local enablement and cooldowns."""
+    from admin.model_busy import get_busy_levels, LABELS
+    models = [row.model_id for row in db.query(ModelConfig.model_id).distinct().all()]
+    result = get_busy_levels(db, models)
+    return {"items": [{"model_id": model, "busy_level": level, "busy_label": LABELS[level]}
+                      for model, level in result["levels"].items()],
+            "observed_at": result["observed_at"], "stale": result["stale"]}
+
+
 def _do_sync_models(db: Session) -> dict:
     """从后端拉取可用模型列表并同步到本地数据库（upsert）。
 

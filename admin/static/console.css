@@ -62,7 +62,11 @@ button:focus-visible, summary:focus-visible { outline:2px solid var(--brand-ink)
 .gateway-chip { font-size:10px; color:var(--fg-muted); margin-left:6px; }
 #actionTooltip { position:fixed; z-index:100; max-width:260px; padding:9px 12px; border-radius:8px; background:#252b35; color:#f7f8fa; box-shadow:0 5px 20px rgba(0,0,0,.12); pointer-events:none; font-size:12px; line-height:1.5; }
 #actionTooltip strong { display:block; font-weight:500; }
-#actionTooltip span { display:block; color:#c1c8d2; font-size:11px; margin-top:3px; }
+#actionTooltip span { display:block; color:#c1c8d2; font-size:11px; margin-top:3px; white-space:pre-line; overflow-wrap:anywhere; }
+.model-busy { display:inline-block; font-size:12px; color:var(--fg-muted); }
+.model-busy.idle, .model-busy.normal { color:var(--brand); }
+.model-busy.busy { color:#c08722; }
+.model-busy.congested, .model-busy.unavailable { color:var(--danger); }
 .limit-note { font-size:12px; line-height:1.7; color:var(--fg-muted); margin:12px 0 18px; }
 .limit-overview { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:18px; }
 .limit-overview > div { border:1px solid var(--border); padding:10px 12px; border-radius:8px; font-size:12px; }

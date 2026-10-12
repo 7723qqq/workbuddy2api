@@ -9,6 +9,36 @@ from email.utils import parsedate_to_datetime
 
 CN_TIME = timezone(timedelta(hours=8))
 DAILY_CODES = frozenset({"6004", "6008"})
+QUEUE_CODES = frozenset({"6020", "6021", "6022"})
+
+
+def queue_retry_time(body: str, now: datetime | None = None) -> datetime | None:
+    """Match the client's queue retry_after seconds/milliseconds normalization."""
+    now = now or datetime.utcnow()
+    candidates = [body[:65536]] + [line[5:].strip() for line in body[:65536].splitlines()
+                                 if line.startswith("data:")][:64]
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+            if not isinstance(obj, dict):
+                continue
+            if str(obj.get("code")) not in QUEUE_CODES:
+                obj = obj.get("error") or obj.get("data")
+            if not isinstance(obj, dict) or str(obj.get("code")) not in QUEUE_CODES:
+                continue
+            data = obj.get("data")
+            value = data.get("retry_after") if isinstance(data, dict) else None
+            if isinstance(value, bool) or value is None:
+                continue
+            raw = float(value)
+            if not math.isfinite(raw) or raw < 0:
+                continue
+            seconds = raw / 1000 if raw >= 1000 else raw
+            if seconds <= 7 * 86400:
+                return now + timedelta(seconds=max(1, seconds))
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def parse_time(value, *, now: datetime) -> datetime | None:

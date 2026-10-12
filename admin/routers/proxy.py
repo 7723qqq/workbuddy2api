@@ -452,7 +452,7 @@ _SESSION_DEAD_MARKERS = ["Offline user session not found", "12153", "session not
 #:
 #: 注：14015/14016 **不在**上游 `isQuotaExhaustedError` 集合里，语义是「授权态问题」
 #: 而非「额度用完」，所以走 account_fault（30 分钟冷却）而不是 hard_credit（次日 04:00）。
-_ACCOUNT_FAULT_CODES = ("11140", "14017", "14015", "14016")
+_ACCOUNT_FAULT_CODES = ("11140", "11142", "14017", "14015", "14016")
 _ACCOUNT_FAULT_MARKERS = ("request illegal from an unapproved channel",
                           "trial version is not yet activated",
                           "trial not activated",
@@ -523,6 +523,10 @@ _QUOTA_EXHAUSTED_CODES = frozenset({"14001", "14012", "14013", "14014", "14018"}
 #:
 #: 冷却时长走 REQUEST_RATE_SECONDS（秒级），不走配额型的 600 秒档。
 _REQUEST_RATE_CODES = frozenset({"14003"})
+# Capacity queue is scoped to the requested model, never the whole account.
+_QUEUE_CODES = frozenset({"6020", "6021", "6022"})
+_INBAND_FAILURE_CODES = (_RATE_LIMIT_CODES | _REQUEST_RATE_CODES | _QUEUE_CODES |
+                        _QUOTA_EXHAUSTED_CODES | frozenset(_ACCOUNT_FAULT_CODES) | {"11141"})
 
 #: Non-rate transient failures eligible for a last-resort candidate.
 #: Explicit rate limits are never bypassed before their recovery time.
@@ -644,7 +648,7 @@ def _looks_like_inband_error(body: str) -> bool:
         c = obj.get("code")
         # Business failures can be returned as HTTP 200 JSON/SSE envelopes.
         # Do not inspect codes embedded in model-generated choices/content.
-        if "choices" not in obj and str(c) in (_RATE_LIMIT_CODES | _REQUEST_RATE_CODES | _QUOTA_EXHAUSTED_CODES):
+        if "choices" not in obj and str(c) in _INBAND_FAILURE_CODES:
             return True
         if isinstance(c, int) and c < 0:
             return True
@@ -820,8 +824,9 @@ _EXHAUSTION_HINTS = {
     "hard_credit": "账号积分已用完（次日 04:00 重置）",
     "soft_rate": "上游限流中，请稍后重试",
     "model_rate": "该模型当前不可用（账号对该模型的额度用尽，或上游模型繁忙）",
+    "model_behavior": "上游模型行为策略拒绝了本次请求",
     "model_block": "上游没有这个模型（该后端不提供）",
-    "account_fault": "账号授权异常（需重新登录/激活）",
+    "account_fault": "账号授权或使用权限受限（请检查上游提示）",
     "session_dead": "账号登录态失效（需重新登录）",
     "upstream_internal": "上游服务器内部故障（如磁盘写满），非本网关问题",
     "server": "上游服务异常",
@@ -914,6 +919,9 @@ def _classify_error(status: int, body: str) -> str:
     # 3. 账号级授权/配额故障（可能带 429，必须先判）
     if code in _ACCOUNT_FAULT_CODES:
         return "account_fault"
+    # Official 5.8.1 classifier: model_service/model_behavior_error, not IP WAF.
+    if code == "11141":
+        return "model_behavior"
     if status == 403:
         for m in _ACCOUNT_FAULT_MARKERS:
             if m in body_l:
@@ -930,7 +938,7 @@ def _classify_error(status: int, body: str) -> str:
     #     官方 UI 对它的文案也是「当前模型请求繁忙，请**切换模型**或稍后重试」。
     #     所以必须走 model_rate（只冷「该账号×该模型」），**绝不能冷账号** ——
     #     否则一个模型抖动就会把整个号池摘空，而其它模型其实都是好的。
-    if code in _REQUEST_RATE_CODES:
+    if code in _REQUEST_RATE_CODES or code in _QUEUE_CODES:
         return "model_rate"
     if code in _ACCOUNT_RATE_CODES:
         return "soft_rate"
@@ -1098,7 +1106,14 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         #   * 14003 是「模型繁忙 / 请求过于频繁」——瞬时，且上游自己的建议
         #     就是「切换模型或稍后重试」。给秒级；即便上游带了 Retry-After，
         #     也按 REQUEST_RATE_MAX_SECONDS 封顶，免得把一次抖动记成小时级。
-        if _json_code(msg) in _REQUEST_RATE_CODES:
+        if _json_code(msg) in _QUEUE_CODES:
+            from admin.model_limits import queue_retry_time
+            # retry_after is a queue polling delay, not an account quota reset.
+            _set_model_cooldown(db, acc, model, "model_queue",
+                                (msg or "model queue")[:255],
+                                reset_at=queue_retry_time(msg, now) or reset_at,
+                                fallback_seconds=max(1, settings.REQUEST_RATE_SECONDS))
+        elif _json_code(msg) in _REQUEST_RATE_CODES:
             cap = max(1, _req_rate_seconds()[1])
             ra = reset_at
             if ra is not None:
@@ -1193,6 +1208,10 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         acc.consecutive_fails = (acc.consecutive_fails or 0) + 1
         acc.last_err_at = now
         acc.last_err_msg = (msg or "upstream internal error")[:255]
+    elif kind == "model_behavior":
+        # Request/model policy rejection must not cool or degrade the entire account.
+        acc.last_err_at = now
+        acc.last_err_msg = (msg or "model behavior policy")[:255]
     elif kind == "server" or status >= 500:
         # HTTP 5xx：熔断（指数退避），不再用「累计 5 次固定 10 分钟」——
         # 固定时长对持续坏的号太短（10 分钟后又被选中再失败），对偶发又太长。
@@ -1293,6 +1312,8 @@ def _set_model_cooldown(db: Session, acc: Account, model: str, kind: str,
         until = reset_at if reset_at is not None and reset_at > now else now + timedelta(seconds=fallback_seconds)
         # Bound invalid upstream values, but never truncate a 24h recovery to 2h.
         until = min(until, now + timedelta(days=7))
+    elif kind == "model_queue" and reset_at is not None and reset_at > now:
+        until = min(reset_at, now + timedelta(days=7))
     elif kind == "model_rate" and reset_at is not None and reset_at > now:
         until = min(reset_at, now + timedelta(seconds=settings.SOFT_RATE_MAX_SECONDS))
     elif kind == "model_block":

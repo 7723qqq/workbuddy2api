@@ -228,6 +228,14 @@ class AccountSession:
     def fetch_models(self) -> list:
         return self.cm.fetch_models()
 
+    def fetch_model_busy(self, models: list[str]) -> dict:
+        """Official desktop endpoint: at most 50 models, five-second timeout."""
+        with httpx.Client(timeout=5) as client:
+            response = client.post(f"{BACKEND}/v2/chat/busy", json={"models": models},
+                                   headers=self.get_headers(cprofile.risk_headers()))
+        response.raise_for_status()
+        return response.json()
+
     def fetch_balance(self) -> dict:
         return self.cm.fetch_balance()
 

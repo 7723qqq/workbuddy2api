@@ -912,7 +912,7 @@
               <th class="px-4 py-3">模型 ID</th><th class="px-4 py-3">级别</th>
               <th class="px-4 py-3"><button type="button" onclick="toggleModelSort()" id="thModelMult"
                 class="inline-flex items-center gap-1 hover:text-slate-700 font-medium" title="点击切换倍率排序（升序 → 降序 → 默认）">倍率 <i class="fa-solid fa-sort text-slate-300"></i></button></th>
-              <th class="px-4 py-3">备注</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th>
+              <th class="px-4 py-3">繁忙程度</th><th class="px-4 py-3">备注</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody id="modelBody"></tbody>
@@ -1677,6 +1677,8 @@ function activateTab(name, opts) {
   if (name === "logs") openLogsPanel();
   if (name === "client") loadClientProfile();
   if (name === "settings") loadAppSource();
+  if (name === "models") loadModelBusy();
+  scheduleModelBusy();
 }
 
 /* ==========================================================================
@@ -1958,12 +1960,22 @@ function accountActionDescription(title) {
   return descriptions[title] || '';
 }
 function accountLimitBadge(a) {
-  const limits = a.model_limits || [];
-  const gateway = a.gateway_state === 'cooling'
-    ? '<span class="gateway-chip">冷却中</span>' : '';
+  const limits = (a.model_limits || []).filter(l => !l.until || Date.parse(l.until) > Date.now());
+  const reasons = {hard_credit:'账号额度耗尽', soft_rate:'账号请求限流', account_fault:'账号授权或风控限制',
+    breaker:'连续失败熔断', degraded:'连续失败退避', waf:'请求被网关拦截', not_found:'接口暂不可用', upstream_internal:'上游暂时故障'};
+  const until = a.gateway_until;
+  const cooling = a.gateway_state === 'cooling' && (!until || Date.parse(until) > Date.now());
+  const reason = reasons[a.gateway_reason] || '账号暂时冷却';
+  const gateway = cooling
+    ? `<span class="gateway-chip" tabindex="0" data-tooltip="${esc(reason)}" data-tooltip-description="${esc('影响该账号全部模型；本地冷却至：' + fmtTime(until) + '，届时仍需上游确认可用')}">账号冷却</span>` : '';
   if (!limits.length) return gateway;
-  const daily = limits.filter(l => l.kind === 'model_daily').length;
-  return gateway + `<button class="limit-chip" onclick="openModelLimits(${a.id})" data-tooltip="${daily ? '模型日额度耗尽' : '模型暂时不可用'}" data-tooltip-description="${limits.length} 个模型冷却中，其他模型仍可调度" aria-label="查看模型冷却">${limits.length} 模型受限</button>`;
+  const kinds = {model_daily:'日额度耗尽', model_rate:'短时限流', model_queue:'上游排队', model_block:'模型不可用'};
+  const detail = limits.map(l => `${l.model} · ${kinds[l.kind] || '暂时受限'} · ${modelLimitDeadlineLabel(l)} ${fmtTime(l.until)}`).join('\n');
+  const scope = cooling ? '另有账号级限制，当前全部模型暂不可调度' : '仅以下模型冷却，其他模型仍可调度';
+  return gateway + `<button class="limit-chip" onclick="openModelLimits(${a.id})" data-tooltip="${limits.length} 个模型冷却" data-tooltip-description="${esc(scope + '\n' + detail)}" aria-label="查看模型冷却列表">${limits.length} 模型冷却</button>`;
+}
+function modelLimitDeadlineLabel(entry) {
+  return {upstream:'上游重置时间',queue_retry:'上游建议重试时间',estimated:'本地保守冷却至',backoff:'本地退避至'}[entry.reset_source] || '本地冷却至';
 }
 
 // One fixed tooltip avoids clipping by scroll containers and supports keyboard focus.
@@ -2023,14 +2035,14 @@ async function openModelLimits(accountId = null) {
     if (!result.ok) { container.textContent = '读取失败，请稍后重试'; return; }
     const d = result.data;
     const entries = (d.items || []).filter(e => accountId == null || e.account_id === accountId);
-    const kind = {model_daily:'日额度耗尽',model_rate:'短时限流',model_block:'模型不可用'};
-    const source = {upstream:'官方恢复时间',estimated:'24 小时保守估计',backoff:'退避时间'};
+    const kind = {model_daily:'日额度耗尽',model_rate:'短时限流',model_queue:'上游排队',model_block:'模型不可用'};
+    const source = {upstream:'上游明确重置时间',queue_retry:'上游 retry_after（重试间隔，不是排队结束时间）',estimated:'本地保守估计，上游未返回重置时间',backoff:'本地退避策略，不代表上游已恢复'};
     container.innerHTML = `<p class="limit-note">积分余额与模型每日额度分别计算；0 倍率模型也可能触发日限额。冷却仅作用于对应账号的对应模型，到期后自动恢复候选资格。今日请求 / Token 仅统计本网关成功调用，无法据此推算官方剩余额度或客户端消耗。</p>
-      ${d.waf_remaining_seconds > 0 ? `<p class="limit-note">出口 IP 保护已触发，约 ${d.waf_remaining_seconds} 秒后恢复。</p>` : ''}
+      ${d.waf_remaining_seconds > 0 ? `<p class="limit-note">出口 IP 保护已触发，约 ${d.waf_remaining_seconds} 秒后解除本地保护，是否可用仍需上游确认。</p>` : ''}
       <h4 class="health-title">模型健康 · 近 24 小时</h4>
-      <div class="overflow-x-auto"><table class="tbl health-table"><thead><tr><th>模型</th><th>可选 / 受限账号</th><th>成功 / 请求</th><th>失败率</th><th>首响应 P50 / P95</th><th>总耗时 P95</th><th>最早模型恢复</th></tr></thead><tbody>${healthResult.ok ? (healthResult.data.items || []).map(m => `<tr><td><b>${esc(m.model)}</b>${m.free ? '<small class="health-free">免费</small>' : ''}</td><td>${m.available_accounts} / ${m.limited_accounts}</td><td>${m.successes} / ${m.requests}</td><td>${m.failure_rate == null ? '—' : (m.failure_rate * 100).toFixed(1) + '%'}</td><td>${m.ttfb_ms.p50 == null ? '—' : m.ttfb_ms.p50 + ' ms'} / ${m.ttfb_ms.p95 == null ? '—' : m.ttfb_ms.p95 + ' ms'}</td><td>${m.latency_ms.p95 == null ? '—' : m.latency_ms.p95 + ' ms'}</td><td>${m.earliest_model_recovery ? fmtTime(m.earliest_model_recovery) : '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">暂无模型观测</td></tr>' : '<tr><td colspan="7" class="account-empty">健康统计暂时不可用</td></tr>'}</tbody></table></div>
-      <p class="limit-note">延迟取最近最多 2000 条成功记录；账号可选数包含当前进程在途占用和出口保护。最早模型恢复不代表账号整体已可用。</p>
-      <div class="overflow-x-auto"><table class="tbl min-w"><thead><tr><th>账号</th><th>模型</th><th>原因</th><th>预计恢复（北京时间）</th><th>依据</th><th>今日请求 / Token</th><th>操作</th></tr></thead><tbody>${entries.map(e => `<tr><td>${esc(e.account_name)}</td><td>${esc(e.model)}</td><td>${kind[e.kind] || esc(e.kind)}</td><td>${fmtTime(e.until)}</td><td>${source[e.reset_source] || '退避时间'}</td><td>${e.requests_today} / ${e.tokens_today}</td><td><button class="console-btn quiet" onclick="clearModelLimit(${e.account_id},${esc(JSON.stringify(e.model))})">解除冷却</button></td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">当前没有模型冷却记录</td></tr>'}</tbody></table></div>`;
+      <div class="overflow-x-auto"><table class="tbl health-table"><thead><tr><th>模型</th><th>可选 / 受限账号</th><th>成功 / 请求</th><th>失败率</th><th>首响应 P50 / P95</th><th>总耗时 P95</th><th>最早冷却截止</th></tr></thead><tbody>${healthResult.ok ? (healthResult.data.items || []).map(m => `<tr><td><b>${esc(m.model)}</b>${m.free ? '<small class="health-free">免费</small>' : ''}</td><td>${m.available_accounts} / ${m.limited_accounts}</td><td>${m.successes} / ${m.requests}</td><td>${m.failure_rate == null ? '—' : (m.failure_rate * 100).toFixed(1) + '%'}</td><td>${m.ttfb_ms.p50 == null ? '—' : m.ttfb_ms.p50 + ' ms'} / ${m.ttfb_ms.p95 == null ? '—' : m.ttfb_ms.p95 + ' ms'}</td><td>${m.latency_ms.p95 == null ? '—' : m.latency_ms.p95 + ' ms'}</td><td>${m.earliest_model_recovery ? fmtTime(m.earliest_model_recovery) : '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">暂无模型观测</td></tr>' : '<tr><td colspan="7" class="account-empty">健康统计暂时不可用</td></tr>'}</tbody></table></div>
+      <p class="limit-note">延迟取最近最多 2000 条成功记录；账号可选数包含当前进程在途占用和出口保护。冷却截止只表示可再次尝试，不保证上游模型或账号已恢复可用。</p>
+      <div class="overflow-x-auto"><table class="tbl min-w"><thead><tr><th>账号</th><th>模型</th><th>原因</th><th>重置 / 重试 / 本地冷却截止（北京时间）</th><th>依据</th><th>今日请求 / Token</th><th>操作</th></tr></thead><tbody>${entries.map(e => `<tr><td>${esc(e.account_name)}</td><td>${esc(e.model)}</td><td>${kind[e.kind] || esc(e.kind)}</td><td>${modelLimitDeadlineLabel(e)}<br>${fmtTime(e.until)}</td><td>${source[e.reset_source] || '本地退避策略'}</td><td>${e.requests_today} / ${e.tokens_today}</td><td><button class="console-btn quiet" onclick="clearModelLimit(${e.account_id},${esc(JSON.stringify(e.model))})">解除冷却</button></td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">当前没有模型冷却记录</td></tr>'}</tbody></table></div>`;
   } catch(e) {
     const container = document.getElementById('modelLimitsContent');
     if (container) container.textContent = '读取失败，请稍后重试';
@@ -3902,6 +3914,38 @@ async function submitEditKey(id){
 async function deleteKey(id){ if(!await uiConfirm({message:"确认删除该 Key？此操作不可恢复。", title:"删除 API Key"}))return; const r=await api("/api/keys/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"删除失败", r.ok?"ok":"err"); if(r.ok) loadKeys(); }
 
 /* ==================== 模型配置 ==================== */
+const MODEL_BUSY_LABELS = {idle:'空闲', normal:'空闲', busy:'轻微拥堵', congested:'极度拥堵', unavailable:'不可用', unknown:'未知'};
+let _modelBusy = {}, _modelBusyTimer = null, _modelBusyLoading = false;
+function modelBusyBadge(m) {
+  const state = _modelBusy[m.model_id] || {};
+  const level = Object.hasOwn(MODEL_BUSY_LABELS, state.busy_level) ? state.busy_level : 'unknown';
+  const tip = state.observed_at ? `上游采集：${fmtTime(state.observed_at)}${state.stale ? '（刷新失败，显示上次结果）' : ''}` : '尚未获取上游繁忙程度';
+  return `<span class="model-busy ${level}" title="${esc(tip)}">${MODEL_BUSY_LABELS[level]}${state.stale && state.observed_at ? ' · 缓存' : ''}</span>`;
+}
+function scheduleModelBusy() {
+  clearTimeout(_modelBusyTimer);
+  _modelBusyTimer = null;
+  if (document.hidden || !TOKEN || $('#panel-models').classList.contains('hidden')) return;
+  _modelBusyTimer = setTimeout(async () => { await loadModelBusy(); scheduleModelBusy(); }, 50000);
+}
+async function loadModelBusy() {
+  if (_modelBusyLoading || document.hidden || !TOKEN || $('#panel-models').classList.contains('hidden')) return;
+  _modelBusyLoading = true;
+  try {
+    const r = await api('/api/models/busy');
+    if (!r.ok) throw new Error('busy fetch failed');
+    const d = await r.json();
+    _modelBusy = Object.fromEntries((d.items || []).map(m => [m.model_id, {...m, observed_at:d.observed_at, stale:d.stale}]));
+    renderModelPage(_modelPage);
+  } catch(e) {
+    Object.values(_modelBusy).forEach(m => { m.stale = true; });
+    renderModelPage(_modelPage);
+  } finally { _modelBusyLoading = false; }
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) loadModelBusy();
+  scheduleModelBusy();
+});
 function modelRow(m) {
   const isFree = m.is_free || (m.credit_multiplier||0) === 0;
   const mult = m.credit_multiplier || 0;
@@ -3912,6 +3956,7 @@ function modelRow(m) {
       <td class="px-4 py-3 font-mono text-xs">${esc(m.model_id)}</td>
       <td class="px-4 py-3">${m.level==='system'?'<span class="px-2 py-0.5 rounded text-[10px] bg-blue-100 text-blue-700">系统</span>':'<span class="px-2 py-0.5 rounded text-[10px] bg-purple-100 text-purple-700">用户</span>'}</td>
       <td class="px-4 py-3">${multDisplay}</td>
+      <td class="px-4 py-3 whitespace-nowrap">${modelBusyBadge(m)}</td>
       <td class="px-4 py-3 text-slate-400 text-xs">${esc(m.note||'-')}</td>
       <td class="px-4 py-3 col-status">${m.enabled?'<span class="badge bg-emerald-100 text-emerald-700">启用</span>':'<span class="badge bg-slate-100 text-slate-500">禁用</span>'}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
@@ -3963,6 +4008,7 @@ async function loadModels(){
   } catch(e) {}
   updateModelSortIcon();
   renderModelPage(_modelPage);
+  loadModelBusy();
 }
 function renderModelPage(p) {
   const term = (_modelTerm = ($("#modelSearch") ? $("#modelSearch").value : "").trim().toLowerCase());
@@ -3974,7 +4020,7 @@ function renderModelPage(p) {
   try { localStorage.setItem("wb_model_page", String(p)); } catch(e) {}
   const slice = data.slice((p - 1) * PS, p * PS);
   $("#modelBody").innerHTML = slice.map(modelRow).join("") ||
-    `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的模型" : "还没有模型配置，点击「从后端同步模型」拉取可用模型列表"}</td></tr>`;
+    `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的模型" : "还没有模型配置，点击「从后端同步模型」拉取可用模型列表"}</td></tr>`;
   $("#modelPager").innerHTML = pagerHtml(total, p, totalPages, "renderModelPage");
 }
 async function syncModels(){
