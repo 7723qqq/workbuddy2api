@@ -359,6 +359,72 @@ def cleanup_orphan_tool_calls(obj: dict) -> int:
     return changed
 
 
+def validate_tool_pairing(messages: list) -> list[str]:
+    """只诊断、不改写：检查 OpenAI messages 里 tool_calls / tool 结果是否配对合法。
+
+    检测项：
+      - assistant.tool_calls[].id 为空
+      - role:tool 的 tool_call_id 为空 / 找不到对应 call
+      - assistant.tool_calls 之后未紧接对应 role:tool（被 user/assistant 插断）
+      - role:tool 出现时当前没有待完成的 tool_calls
+
+    返回问题描述列表（空列表 = 合法）。
+    """
+    problems: list[str] = []
+    if not isinstance(messages, list):
+        return ["messages is not a list"]
+
+    pending: dict[str, int] = {}  # tool_call_id -> assistant msg index
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            problems.append(f"msg[{i}] is not an object")
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            # 先检查上一轮是否还有未闭合的 tool_calls
+            if pending:
+                missing = list(pending.keys())[:5]
+                problems.append(
+                    f"msg[{i}] assistant starts with unclosed tool_calls {missing}"
+                )
+                pending.clear()
+            tcs = m.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
+                for j, tc in enumerate(tcs):
+                    if not isinstance(tc, dict):
+                        problems.append(f"msg[{i}].tool_calls[{j}] is not an object")
+                        continue
+                    cid = tc.get("id")
+                    if not (isinstance(cid, str) and cid):
+                        problems.append(f"msg[{i}].tool_calls[{j}] has empty id")
+                        continue
+                    if cid in pending:
+                        problems.append(f"msg[{i}].tool_calls[{j}] duplicate id={cid}")
+                    pending[cid] = i
+        elif role == "tool":
+            tid = m.get("tool_call_id")
+            if not (isinstance(tid, str) and tid):
+                problems.append(f"msg[{i}] tool has empty tool_call_id")
+                continue
+            if tid not in pending:
+                problems.append(f"msg[{i}] orphan tool result id={tid}")
+            else:
+                pending.pop(tid, None)
+        else:
+            # user/system 等出现在 tool 配对中间 → 顺序错误
+            if pending:
+                missing = list(pending.keys())[:5]
+                problems.append(
+                    f"msg[{i}] role={role} interrupts tool pairing, missing results for {missing}"
+                )
+                pending.clear()
+
+    if pending:
+        missing = list(pending.keys())[:5]
+        problems.append(f"messages end with unclosed tool_calls {missing}")
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # 5. reasoning_effort 档位归一
 # ---------------------------------------------------------------------------

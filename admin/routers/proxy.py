@@ -30,7 +30,7 @@ from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, Usa
 from admin.routers.models import _is_model_allowed
 from admin.security import check_quota, get_key_row
 from admin.pool import POOL
-from upstream_compat import normalize_tool_choice
+from upstream_compat import normalize_tool_choice, cleanup_orphan_tool_calls, validate_tool_pairing
 
 HTTP_LIMITS = backend.HTTP_LIMITS
 
@@ -123,6 +123,35 @@ try:
 except Exception:  # pragma: no cover - 降级分支
     _DESENSITIZE_AVAILABLE = False
     desensitize_body = None
+
+
+def _cleanup_orphan_tools(chat_body: dict) -> int:
+    """删除配不成对的 tool_calls / role:tool，防止上游 11148。
+
+    只做 ID 孤儿清理，不改 stream/thinking（勿用 prepare_upstream_body）。
+    """
+    try:
+        n = cleanup_orphan_tool_calls(chat_body)
+        if n:
+            _logger.warning("[tool-cleanup] removed=%d | diag=%s", n, _tool_diag(chat_body))
+        return n
+    except Exception as e:
+        _logger.warning("[tool-cleanup] failed: %s", e)
+        return 0
+
+
+def _tool_diag(chat_body: dict) -> str:
+    """截断的角色序列 + tool 配对问题摘要，便于排查 11148。"""
+    try:
+        msgs = (chat_body or {}).get("messages") or []
+        roles = [m.get("role", "?") for m in msgs if isinstance(m, dict)]
+        role_seq = ",".join(roles[:40])
+        if len(roles) > 40:
+            role_seq += ",…"
+        problems = validate_tool_pairing(msgs)
+        return f"roles=[{role_seq}] n={len(roles)} problems={problems[:5]}"
+    except Exception as e:
+        return f"diag-failed:{e}"
 
 
 def _desensitize_chat_body(chat_body: dict) -> dict:
@@ -2265,6 +2294,7 @@ async def chat_completions(
     session_hdr = _session_headers(body, "")
     # 与 /v1/messages 同一套 harness 脱敏：OpenAI 反代不过这道过滤，
     # system/tools 里的合规声明词会被上游内容审核整条拒掉（11128）。
+    _cleanup_orphan_tools(body)
     body = _desensitize_chat_body(body)
 
     async def _stream(aggregate: bool = False):
@@ -2758,6 +2788,7 @@ async def responses_proxy(
     sticky_key = pool.session_key_for(chat_body)
     session_hdr = _session_headers(chat_body, "")
     # 与 /v1/messages 同一套 harness 脱敏（OpenAI Responses 也要过这道过滤）。
+    _cleanup_orphan_tools(chat_body)
     chat_body = _desensitize_chat_body(chat_body)
 
     if not client_wants_stream:
@@ -2814,6 +2845,8 @@ async def responses_proxy(
                             r = await client.post(url, headers=headers_i, json=body)
                             if r.status_code >= 400 or (r.status_code == 200 and _looks_like_inband_error(r.text)):
                                 _logger.warning("[forward] upstream %s | body=%s", r.status_code, r.text[:400])
+                                if "11148" in r.text or "tool calls and tool results" in r.text:
+                                    _logger.warning("[forward] tool-pairing diag | %s", _tool_diag(body))
                             if r.status_code >= 400:
                                 text = r.text[:65536]
                                 kind = _classify_error(r.status_code, text)
@@ -3168,6 +3201,7 @@ async def anthropic_messages(
     try:
         chat_body = anthropic_request_to_chat(payload)
         normalize_tool_choice(chat_body)
+        _cleanup_orphan_tools(chat_body)
     except Exception as e:
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"请求转换失败：{e}", "type": "invalid_request"}})
@@ -3265,6 +3299,8 @@ async def anthropic_messages(
                             r = await client.post(url, headers=headers_i, json=body)
                             if r.status_code >= 400 or (r.status_code == 200 and _looks_like_inband_error(r.text)):
                                 _logger.warning("[forward] upstream %s | body=%s", r.status_code, r.text[:400])
+                                if "11148" in r.text or "tool calls and tool results" in r.text:
+                                    _logger.warning("[forward] tool-pairing diag | %s", _tool_diag(body))
                             if r.status_code >= 400:
                                 text = r.text[:65536]
                                 kind = _classify_error(r.status_code, text)
@@ -3439,6 +3475,8 @@ async def anthropic_messages(
                                     detail = await r.aread()
                                     text = detail[:65536].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:65536]
                                     _logger.warning("[forward-cc-stream] upstream %s | body=%s", r.status_code, text[:400])
+                                    if "11148" in text or "tool calls and tool results" in text:
+                                        _logger.warning("[forward-cc-stream] tool-pairing diag | %s", _tool_diag(body))
                                     kind = _classify_error(r.status_code, text)
                                     await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                           model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
