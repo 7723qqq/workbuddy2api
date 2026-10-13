@@ -343,6 +343,40 @@ def _looks_like_harness_user_message(content) -> bool:
     return any(marker in text for marker in _HARNESS_USER_MARKERS)
 
 
+def _extract_user_payload(text: str) -> str:
+    """去掉 harness 注入块/尾部元数据，**保留用户真实输入**。
+
+    Claude Code 常把提问和 <system-reminder> 写进同一条 user 消息：
+        "<system-reminder>...</system-reminder>\\n\\nWhat is 1+1?"
+    此前 compact 会整条换成固定摘要，把用户提问一并吞掉（首轮只回
+    "I'm ready to help..."）。这里只剥注入块，剩什么就留什么。
+    """
+    if not text:
+        return ""
+    out = text
+    for start_tag, end_tag, _replacement in _RUNTIME_BLOCK_REPLACEMENTS:
+        out = re.sub(
+            r"\s*" + re.escape(start_tag) + r".*?" + re.escape(end_tag) + r"\s*",
+            "\n",
+            out,
+            flags=re.DOTALL,
+        )
+        # 未闭合的尾块（截断/异常注入）：从起始标签截到结尾
+        if start_tag in out and end_tag not in out:
+            out = re.sub(r"\s*" + re.escape(start_tag) + r".*$", "\n", out, flags=re.DOTALL)
+
+    tail_indexes = [out.find(marker) for marker in _RUNTIME_TAIL_MARKERS if marker in out]
+    if tail_indexes:
+        out = out[: min(idx for idx in tail_indexes if idx >= 0)]
+
+    for _start, _end, replacement in _RUNTIME_BLOCK_REPLACEMENTS:
+        out = out.replace(replacement, " ")
+    out = out.replace(_RUNTIME_TAIL_SUMMARY, " ")
+
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+
 def _prune_runtime_fragments(role: str, text: str) -> str:
     """轻量裁掉冗长的运行时元数据，保留主要行为指令。
 
@@ -394,16 +428,13 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
         else:
             pruned = _CODEX_CORE_SUMMARY
 
-    if role == "user" and _looks_like_harness_user_message(pruned):
-        if (
-            "# AGENTS.md instructions" in pruned
-            or "<environment_context>" in text
-            or "<skills_instructions>" in text
-        ):
-            return (
-                "Repository instructions and durable user context are provided. "
-                "Follow repository guidance while answering the user's actual request."
-            )
+    if role == "user" and _looks_like_harness_user_message(text):
+        residual = _extract_user_payload(text)
+        # 有真实提问就保留；纯 harness 才换成摘要，避免吞掉用户输入
+        return residual if residual else (
+            "Repository instructions and durable user context are provided. "
+            "Follow repository guidance while answering the user's actual request."
+        )
 
     pruned = re.sub(r"\n{3,}", "\n\n", pruned).strip()
     return pruned
@@ -431,6 +462,10 @@ def _compact_harness_message(role: str, content) -> str | None:
             "Runtime skill metadata is available. Use relevant skills only when explicitly requested or clearly applicable."
         )
     if role == "user" and _looks_like_harness_user_message(content):
+        residual = _extract_user_payload(text)
+        if residual:
+            # 用户提问和 harness 混在同一块：只剥注入，保留提问
+            return residual
         return (
             "Repository instructions and environment context are provided. Follow repository guidance "
             "while answering the user's actual request."
