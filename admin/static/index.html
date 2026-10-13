@@ -1997,7 +1997,7 @@ function accountLimitBadge(a) {
   const cooling = a.gateway_state === 'cooling' && (!until || Date.parse(until) > Date.now());
   const reason = reasons[a.gateway_reason] || '账号暂时冷却';
   const gateway = cooling
-    ? `<span class="gateway-chip" tabindex="0" data-tooltip="${esc(reason)}" data-tooltip-description="${esc('影响该账号全部模型；本地冷却至：' + fmtTime(until) + '，届时仍需上游确认可用')}">账号冷却</span>` : '';
+    ? `<button type="button" class="gateway-chip" onclick="clearAccountCooldown(${a.id})" data-tooltip="${esc(reason)} · 点击解除" data-tooltip-description="${esc('影响该账号全部模型；本地冷却至：' + fmtTime(until) + '。点击立即清除该账号冷却，使其重新参与调度。')}">账号冷却</button>` : '';
   if (!limits.length) return gateway;
   const kinds = {model_daily:'日额度耗尽', model_rate:'短时限流', model_queue:'上游排队', model_block:'模型不可用'};
   const detail = limits.map(l => `${l.model} · ${kinds[l.kind] || '暂时受限'} · ${modelLimitDeadlineLabel(l)} ${fmtTime(l.until)}`).join('\n');
@@ -2083,6 +2083,14 @@ async function clearModelLimit(accountId, model) {
   const r = await api('/api/accounts/' + accountId + '/model-limits/clear', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model})});
   if (!r.ok) { toast('解除失败','err'); return; }
   toast('已解除本地冷却'); loadAccounts(); openModelLimits();
+}
+async function clearAccountCooldown(accountId) {
+  if (!await uiConfirm({title:'解除账号冷却',message:'仅清除该账号的本地冷却 / 熔断 / 降权状态，不会重置官方额度，也不影响模型级冷却；再次触发后将重新冷却。',danger:false})) return;
+  const r = await api('/api/accounts/' + accountId + '/cooldown/clear', {method:'POST'});
+  const { ok, data } = await safeJson(r);
+  if (!ok) { toast('解除失败' + (data && data.detail ? '：' + data.detail : ''), 'err'); return; }
+  toast(data && data.cleared ? '已解除账号冷却' : '该账号当前不在冷却中');
+  loadAccounts();
 }
 
 function accRow(a) {
