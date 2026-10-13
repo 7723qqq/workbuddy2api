@@ -103,3 +103,11 @@ android/**/build/
 *.jks
 *.keystore
 
+
+# Local SQLite databases (runtime data)
+workbuddy_admin.db
+workbuddy_admin.db-shm
+workbuddy_admin.db-wal
+
+# Local credentials file
+登录密码.txt
