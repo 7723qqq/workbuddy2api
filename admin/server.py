@@ -241,6 +241,11 @@ def _startup():
     if db_ok:
         from admin.scheduler import start_scheduler
         start_scheduler()
+        try:
+            from admin.post_login import resume
+            resume()
+        except Exception:
+            logger.exception("恢复登录后自动任务失败（不影响服务启动）")
 
     # 预热设备风控 token：桌面端不存在时也会填上负缓存，
     # 避免每个请求都在事件循环里同步 fork 一次 node 造成阻塞。

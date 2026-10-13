@@ -182,6 +182,7 @@ class UsageLog(Base):
     client_ip = Column(String(64), default="")
     # 用途标识（透传给上游的 X-Agent-Purpose），便于风控审计与上游请求用量对齐
     use_case = Column(String(64), default="")
+    reasoning_effort = Column(String(32), default="")  # Requested effort; empty means model default.
     # 请求级表格日志字段（ logging）：TTFB / 总耗时 / 序号 / 错误分类
     seq = Column(Integer, default=0)
     ttfb_ms = Column(Integer, nullable=True, default=None)

@@ -2108,6 +2108,7 @@ function accRow(a) {
       <div class="nm">
         <b title="${esc(a.name || "未命名")}">${esc(a.name || "未命名")}</b>
         <span class="c-uid" title="${esc(a.uid || "")}">${esc(a.uid || "-")}</span>
+        ${a.post_login_automation ? `<small style="color:var(--fg-muted)" title="${esc((a.post_login_automation.result?.errors || []).join('；'))}">${esc(({queued:'自动任务排队中',running:'自动任务执行中',completed:'自动任务已完成',failed:'部分自动任务未完成'})[a.post_login_automation.status] || '')}</small>` : ''}
       </div>
     </td>
     <td class="col-status" data-label="状态">${badge(a.status)}${accountLimitBadge(a)}</td>
@@ -2309,6 +2310,7 @@ function jobProgressHtml(d, opts) {
        ${d.current ? `<div class="text-xs text-slate-500 mb-2">
            <i class="fa-solid fa-circle-notch fa-spin mr-1 text-sky-500"></i>
            正在处理 <b class="text-slate-700">${esc(d.current)}</b>${taskBit}
+           ${d.task_current ? `<div class="mt-1">${esc(d.task_current)}</div>` : ""}
          </div>` : ""}`;
 
   return `${head}
@@ -5056,7 +5058,7 @@ function logRow(l) {
     <td class="text-xs whitespace-nowrap tnum" style="color:var(--fg-subtle)">${fmtTime(l.created_at)}</td>
     <td class="text-xs font-mono" title="${esc(l.key_name)}">${esc((l.key_name||'').slice(0,10))}</td>
     <td class="text-xs" title="${esc(l.account_name)}">${esc((l.account_name||'').slice(0,14))}</td>
-    <td class="font-mono text-[11px] whitespace-nowrap" title="${esc(l.model)}">${esc((l.model||'').slice(0,24))}</td>
+    <td class="font-mono text-[11px] whitespace-nowrap" title="${esc(l.model)}">${esc((l.model||'').slice(0,24))}<small class="block mt-1" style="color:var(--fg-muted)" title="客户端请求的思考强度；空值表示请求未指定或历史日志未记录">思考：${esc(l.reasoning_effort || '默认 / 未记录')}</small></td>
     <td>${tokenHtml}</td>
     <td class="text-xs text-right">${credHtml}</td>
     <td>${latencyHtml}</td>

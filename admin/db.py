@@ -131,6 +131,7 @@ def init_db() -> bool:
         _ensure_column("usage_logs", "cached_tokens", "INT", "NULL")
         _ensure_column("usage_logs", "client_ip", "VARCHAR(64)", "DEFAULT ''")
         _ensure_column("usage_logs", "use_case", "VARCHAR(64)", "DEFAULT ''")
+        _ensure_column("usage_logs", "reasoning_effort", "VARCHAR(32)", "DEFAULT ''")
         # 迁移：给 usage_logs 表加请求级表格日志字段
         _ensure_column("usage_logs", "seq", "INT", "DEFAULT 0")
         _ensure_column("usage_logs", "ttfb_ms", "INT", "NULL")

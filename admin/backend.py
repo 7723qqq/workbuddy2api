@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -218,10 +219,19 @@ class AccountSession:
     """把一个账号的 auth_json 包成可用的后端会话。"""
 
     def __init__(self, auth_json: str):
+        self._http = None
         self._path = tempfile.mktemp(suffix=".info")
         with open(self._path, "w", encoding="utf-8") as f:
             f.write(auth_json)
         self.cm = CredentialManager(Path(self._path))
+
+    @contextmanager
+    def http_client(self, timeout=15):
+        """Reuse TLS connections throughout one account's task run."""
+        if self._http is None:
+            self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS)
+        self._http.timeout = httpx.Timeout(timeout)
+        yield self._http
 
     def get_headers(self, extra: dict | None = None) -> dict:
         return self.cm.get_headers(extra=extra)
@@ -354,7 +364,7 @@ class AccountSession:
         headers = self.cm.get_headers()
         url = f"{BACKEND}{path}"
         try:
-            with httpx.Client(timeout=15, limits=HTTP_LIMITS) as c:
+            with self.http_client(timeout=15) as c:
                 if method.upper() == "GET":
                     r = c.get(url, headers=headers)
                 else:
@@ -431,6 +441,13 @@ class AccountSession:
         Returns:
             (是否已达标, 说明文字)
         """
+        # A re-login may already have finished the conversation prerequisite.
+        try:
+            if any(t.get("task_code") == "first_buddy" and
+                   t.get("accept_status") in ("completed", "claimed") for t in self.growth_tasks()):
+                return True, "首次对话门槛已达标"
+        except Exception:
+            pass
         for i in range(self.BUDDY_GATE_CHATS):
             try:
                 r = self.growth_fire_event(["chat_request_send"])
@@ -441,18 +458,23 @@ class AccountSession:
             if i + 1 < self.BUDDY_GATE_CHATS:
                 time.sleep(1.5)
 
-        # 复查任务是否达标
-        time.sleep(1.5)
-        try:
-            for t in self.growth_tasks():
-                if t.get("task_code") == "first_buddy":
+        # Poll the actual unlock; one fixed 1.5s wait misses delayed onboarding.
+        deadline = time.monotonic() + 12
+        message = "未找到 first_buddy 任务"
+        while True:
+            try:
+                for t in self.growth_tasks():
+                    if t.get("task_code") != "first_buddy":
+                        continue
                     if t.get("accept_status") in ("completed", "claimed"):
                         return True, "已完成首次对话，门槛达标"
                     pr = t.get("progress") or {}
-                    return False, (f"对话后仍未达标（{pr.get('current')}/{pr.get('target')}）")
-        except Exception as e:
-            return False, f"复查任务状态异常：{e}"
-        return False, "未找到 first_buddy 任务"
+                    message = f"对话后仍未达标（{pr.get('current')}/{pr.get('target')}）"
+            except Exception:
+                message = "首次对话门槛状态查询失败"
+            if time.monotonic() >= deadline:
+                return False, message
+            time.sleep(.5)
 
     def run_cat_travel(self, location_id: int = 4) -> dict:
         """执行一趟猫猫旅行，返回结构化分步结果（供前端逐步提示）。
@@ -682,16 +704,35 @@ class AccountSession:
         headers = self.cm.get_headers()
         headers["Content-Type"] = "application/json"
         try:
-            with httpx.Client(timeout=60, limits=HTTP_LIMITS) as c:
+            with self.http_client(timeout=httpx.Timeout(10, connect=5)) as c:
                 with c.stream("POST", f"{BACKEND}/v2/chat/completions",
                               headers=headers, json=body) as r:
                     status = r.status_code
                     # 读完（或读到足够判断的量）后关闭，避免连接悬挂
-                    n = 0
-                    for _ in r.iter_lines():
-                        n += 1
-                        if n > 50:
+                    if status != 200:
+                        return {"ok": False, "status": status, "msg": f"HTTP {status}"}
+                    deadline = time.monotonic() + 20
+                    completed = False
+                    for line in r.iter_lines():
+                        if time.monotonic() >= deadline:
+                            return {"ok": False, "status": status, "msg": "任务对话超时"}
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            completed = True
                             break
+                        try:
+                            chunk = json.loads(data)
+                        except (TypeError, ValueError):
+                            continue
+                        if chunk.get("error"):
+                            return {"ok": False, "status": status, "msg": "任务对话返回上游错误"}
+                        if any(c.get("finish_reason") for c in chunk.get("choices", [])):
+                            completed = True
+                            break
+                    if not completed:
+                        return {"ok": False, "status": status, "msg": "任务对话未完整返回"}
         except Exception as e:
             return {"ok": False, "status": 0, "msg": f"网络失败: {e}"}
         return {"ok": status == 200, "status": status,
@@ -786,7 +827,7 @@ class AccountSession:
     def _post_report(self, url: str, headers: dict, events: list[dict]) -> dict:
         """上报事件；返回 {ok, status, code, msg}，不抛异常。"""
         try:
-            with httpx.Client(timeout=20, limits=HTTP_LIMITS) as c:
+            with self.http_client(timeout=20) as c:
                 r = c.post(url, headers=headers, json=events)
         except Exception as e:
             return {"ok": False, "status": 0, "code": None,
@@ -843,7 +884,7 @@ class AccountSession:
         """向 chat 域发请求并返回 data 段；失败返回 {}。"""
         url = BACKEND.rstrip("/") + path
         try:
-            with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+            with self.http_client(timeout=25) as c:
                 if body is None:
                     r = c.get(url, headers=self._chat_headers())
                 else:
@@ -922,7 +963,7 @@ class AccountSession:
         body = {"platform": "client", "kind": "theme", "version": "2.63.2",
                 "lang": "zh-CN"}
         try:
-            with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+            with self.http_client(timeout=25) as c:
                 r = c.post(url, headers=self._chat_headers(), json=body)
             if r.status_code != 200:
                 return []
@@ -1090,7 +1131,7 @@ class AccountSession:
             arr.append(m)
         url = BACKEND.rstrip("/") + "/v2/report"
         try:
-            with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+            with self.http_client(timeout=25) as c:
                 r = c.post(url, headers=self._desktop_headers(), json=arr)
         except Exception as e:
             return {"ok": False, "status": 0, "code": None, "msg": f"网络失败: {e}"}
@@ -1242,22 +1283,40 @@ class AccountSession:
         body: dict = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
             body["params"] = params
-        with httpx.Client(timeout=60, limits=HTTP_LIMITS) as c:
-            r = c.post(ARDOT_MCP_URL, headers=headers, json=body)
-            if r.status_code >= 400:
-                raise RuntimeError(f"Ardot MCP HTTP {r.status_code}: {r.text[:200]}")
-            text = r.text
-        # 优先按 SSE 解析
-        for line in text.splitlines():
-            if line.startswith("data:"):
-                try:
-                    return json.loads(line[5:].strip())
-                except Exception:
-                    continue
-        try:
-            return json.loads(text)
-        except Exception:
-            raise RuntimeError(f"Ardot MCP 响应无法解析: {text[:200]}")
+        with self.http_client(timeout=httpx.Timeout(25, connect=5)) as c:
+            with c.stream("POST", ARDOT_MCP_URL, headers=headers, json=body) as r:
+                if r.status_code >= 400:
+                    raise RuntimeError(f"Ardot MCP HTTP {r.status_code}")
+                if "text/event-stream" not in r.headers.get("content-type", ""):
+                    obj = json.loads(r.read())
+                    if isinstance(obj, dict) and obj.get("id") == rid:
+                        return obj
+                    raise RuntimeError("Ardot MCP 响应 id 不匹配")
+                # MCP may keep the SSE connection alive after the RPC result.
+                # Return on our matching result rather than waiting for EOF.
+                deadline = time.monotonic() + 30
+                data = []
+                for line in r.iter_lines():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Ardot MCP 等待结果超时")
+                    if line.startswith("data:"):
+                        data.append(line[5:].lstrip())
+                    elif not line and data:
+                        try:
+                            obj = json.loads("\n".join(data))
+                        except ValueError:
+                            obj = None
+                        data = []
+                        if isinstance(obj, dict) and obj.get("id") == rid:
+                            return obj
+                if data:
+                    try:
+                        obj = json.loads("\n".join(data))
+                    except ValueError:
+                        obj = None
+                    if isinstance(obj, dict) and obj.get("id") == rid:
+                        return obj
+                raise RuntimeError("Ardot MCP 未返回匹配的调用结果")
 
     def create_ardot_canvas(self, file_name: str = "") -> tuple[str, str]:
         r"""通过 Ardot MCP 真正创建一个画布，返回 (file_id, file_url)。
@@ -1421,7 +1480,7 @@ class AccountSession:
         for base in self._ardot_connector_bases():
             path = "/v2/as/connector/oauth/ardot/status"
             try:
-                with httpx.Client(timeout=20, limits=HTTP_LIMITS) as c:
+                with self.http_client(timeout=20) as c:
                     r = c.get(base + path, headers=headers)
                 if r.status_code != 200:
                     continue
@@ -1474,7 +1533,7 @@ class AccountSession:
         def _post(path: str) -> tuple[int, dict, str]:
             for base in self._ardot_connector_bases():
                 try:
-                    with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+                    with self.http_client(timeout=25) as c:
                         r = c.post(base + path, headers=headers, json={})
                 except Exception as e:
                     last = (0, {}, f"{type(e).__name__}: {e}")
@@ -1512,7 +1571,7 @@ class AccountSession:
         # 3) 半失效态：记录在但票取不到 -> revoke 后重绑
         if _already_connected(http, obj, loc) and not self.fetch_ardot_token():
             try:
-                with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+                with self.http_client(timeout=25) as c:
                     for base in self._ardot_connector_bases():
                         c.post(base + "/v2/as/connector/oauth/ardot/revoke",
                                headers=headers, json={})
@@ -1576,7 +1635,7 @@ class AccountSession:
         for base in self._ardot_connector_bases():
             for path in paths:
                 try:
-                    with httpx.Client(timeout=20, limits=HTTP_LIMITS) as c:
+                    with self.http_client(timeout=20) as c:
                         r = c.get(base + path, headers=headers)
                     if r.status_code != 200:
                         continue
@@ -1602,6 +1661,9 @@ class AccountSession:
         self.close()
 
     def close(self):
+        if self._http is not None:
+            self._http.close()
+            self._http = None
         try:
             os.unlink(self._path)
         except OSError:

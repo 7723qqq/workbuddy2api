@@ -428,6 +428,8 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
     rows = db.query(Account).order_by(Account.id.desc()).all()
     now = datetime.utcnow()
     limits = _active_model_limits(db, now)
+    from admin.post_login import states
+    automation = states(db, [a.id for a in rows])
     items = [
         {
             "id": a.id,
@@ -442,6 +444,7 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "last_used_at": a.last_used_at.isoformat() if a.last_used_at else None,
             "created_at": a.created_at.isoformat() if a.created_at else None,
             "model_limits": limits.get(a.id, []),
+            "post_login_automation": automation.get(a.id),
             **_gateway_fields(a, now),
             **_credit_fields(a),
         }

@@ -271,6 +271,27 @@ def _session_headers(body: dict, uid: str) -> dict:
 
 
 
+def _reasoning_effort(payload: dict) -> str:
+    """Keep only a bounded request setting, never prompts or arbitrary payloads."""
+    effort = payload.get("reasoning_effort") or payload.get("reasoningEffort")
+    reasoning = payload.get("reasoning")
+    if not effort:
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
+    allowed = {"off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"}
+    if isinstance(effort, str) and effort.strip().lower() in allowed:
+        return effort.strip().lower()
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        if thinking.get("type") == "disabled":
+            return "off"
+        budget = thinking.get("budget_tokens")
+        if isinstance(budget, int) and not isinstance(budget, bool) and 0 <= budget <= 10**9:
+            return f"budget:{budget}"
+        if thinking.get("type") in ("enabled", "adaptive"):
+            return thinking["type"]
+    return ""
+
+
 def _record_usage(key_id: int, account_id: int, model: str, credits: float | None,
                   updated_auth_json: str | None, *,
                   client_ip: str = "", use_case: str = "",
@@ -278,7 +299,8 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                   completion_tokens: int | None = None, total_tokens: int | None = None,
                   cached_tokens: int | None = None,
                   seq: int = 0, ttfb_ms: int | None = None,
-                  latency_ms: int | None = None, error_kind: str = "") -> int | None:
+                  latency_ms: int | None = None, error_kind: str = "",
+                  reasoning_effort: str = "") -> int | None:
     """流式响应结束后独立开一个 DB 会话写入用量/额度。
 
     关键点：请求作用域的 db 会话在端点返回 StreamingResponse 时已被依赖 teardown 关闭，
@@ -328,6 +350,7 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                 prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                 total_tokens=total_tokens, cached_tokens=cached_tokens,
                 client_ip=client_ip or "", use_case=use_case or "",
+                reasoning_effort=reasoning_effort,
                 seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms, error_kind=error_kind or "",
             )
             db.add(log)
@@ -2411,7 +2434,7 @@ async def chat_completions(
                                 seq = _log_chat_row(None, latency_ms, final_model, mode,
                                                     final_uid, 200, None, error_kind=kind)
                                 await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
-                                              client_ip=_client_ip(request),
+                                              reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request),
                                               use_case="chat-completion", seq=seq,
                                               latency_ms=latency_ms, error_kind=kind)
                                 sess_i.close()
@@ -2441,7 +2464,7 @@ async def chat_completions(
                                 seq = _log_chat_row(None, latency_ms, final_model, mode,
                                                     final_uid, 200, None, error_kind=kind)
                                 await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
-                                              client_ip=_client_ip(request),
+                                              reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request),
                                               use_case="chat-completion", seq=seq,
                                               latency_ms=latency_ms, error_kind=kind)
                                 sess_i.close()
@@ -2477,7 +2500,7 @@ async def chat_completions(
                             POOL.release(held_uid)
                             held_uid = ""
                             await _blocking_call(_record_usage, key.id, final_acc_id, final_model, usage["credits"], updated,
-                                          client_ip=_client_ip(request), use_case="chat-completion",
+                                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="chat-completion",
                                           prompt_tokens=usage["prompt_tokens"],
                                           completion_tokens=usage["completion_tokens"],
                                           total_tokens=usage["total_tokens"],
@@ -2525,7 +2548,7 @@ async def chat_completions(
             err_kind = last_err_kind or ("no_account" if not last_err_msg else "transport")
             seq = _log_chat_row(None, latency_ms, final_model, mode, "-", status_out, None, error_kind=err_kind)
             await _blocking_call(_record_usage, key.id, 0, final_model, 0.0, None,
-                          client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
+                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
             err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n)
             err_obj = {"error": {"message": err_msg, "type": "no_model_available"}}
@@ -2752,7 +2775,7 @@ async def responses_proxy(
                             POOL.release(held_uid)
                             held_uid = ""
                             await _blocking_call(_record_usage, key.id, acc_i.id, m, cost_info["credits"], updated,
-                                          client_ip=_client_ip(request), use_case="responses",
+                                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="responses",
                                           prompt_tokens=cost_info["prompt_tokens"],
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
@@ -2771,7 +2794,7 @@ async def responses_proxy(
                         continue
             seq = _log_chat_row(None, None, resolved, "resp", "-", 503, None, error_kind="no_account")
             await _blocking_call(_record_usage, key.id, 0, resolved, 0.0, None,
-                          client_ip=_client_ip(request), use_case="responses", seq=seq, error_kind="no_account")
+                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="responses", seq=seq, error_kind="no_account")
             if POOL.waf.active():
                 return JSONResponse(status_code=503, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
@@ -2916,7 +2939,7 @@ async def responses_proxy(
                                 seq = _log_chat_row(None, latency_ms, final_model, "resp", final_uid,
                                                     200, None, error_kind=kind)
                                 await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
-                                              client_ip=_client_ip(request), use_case="responses",
+                                              reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="responses",
                                               seq=seq, latency_ms=latency_ms, error_kind=kind)
                                 sess_i.close()
                                 POOL.release(held_uid)
@@ -2948,7 +2971,7 @@ async def responses_proxy(
                             POOL.release(held_uid)
                             held_uid = ""
                             await _blocking_call(_record_usage, key.id, final_acc_id, final_model, usage["credits"], updated,
-                                          client_ip=_client_ip(request), use_case="responses",
+                                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="responses",
                                           prompt_tokens=usage["prompt_tokens"],
                                           completion_tokens=usage["completion_tokens"],
                                           total_tokens=usage["total_tokens"],
@@ -2977,7 +3000,7 @@ async def responses_proxy(
             err_kind = last_err_kind or "no_account"
             seq = _log_chat_row(None, latency_ms, final_model, "resp", "-", 503, None, error_kind=err_kind)
             await _blocking_call(_record_usage, key.id, 0, final_model, 0.0, None,
-                          client_ip=_client_ip(request), use_case="responses", seq=seq, latency_ms=latency_ms,
+                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="responses", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
             if err_kind == "waf":
                 msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
@@ -3209,7 +3232,7 @@ async def anthropic_messages(
                             POOL.release(held_uid)
                             held_uid = ""
                             await _blocking_call(_record_usage, key.id, acc_i.id, m, cost_info["credits"], updated,
-                                          client_ip=_client_ip(request), use_case="anthropic",
+                                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="anthropic",
                                           prompt_tokens=cost_info["prompt_tokens"],
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
@@ -3228,7 +3251,7 @@ async def anthropic_messages(
                         continue
             seq = _log_chat_row(None, None, resolved, "anthropic", "-", 503, None, error_kind="no_account")
             await _blocking_call(_record_usage, key.id, 0, resolved, 0.0, None,
-                          client_ip=_client_ip(request), use_case="anthropic",
+                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="anthropic",
                           seq=seq, error_kind="no_account")
             if POOL.waf.active():
                 return JSONResponse(status_code=503, content={"error": {
@@ -3375,7 +3398,7 @@ async def anthropic_messages(
                                 seq = _log_chat_row(None, latency_ms, final_model, "anthropic",
                                                     final_uid, 200, None, error_kind=kind)
                                 await _blocking_call(_record_usage, key.id, final_acc_id, final_model, 0.0, None,
-                                              client_ip=_client_ip(request), use_case="anthropic",
+                                              reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="anthropic",
                                               seq=seq, latency_ms=latency_ms, error_kind=kind)
                                 sess_i.close()
                                 POOL.release(held_uid)
@@ -3407,7 +3430,7 @@ async def anthropic_messages(
                             POOL.release(held_uid)
                             held_uid = ""
                             await _blocking_call(_record_usage, key.id, final_acc_id, final_model, usage["credits"], updated,
-                                          client_ip=_client_ip(request), use_case="anthropic",
+                                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="anthropic",
                                           prompt_tokens=usage["prompt_tokens"],
                                           completion_tokens=usage["completion_tokens"],
                                           total_tokens=usage["total_tokens"],
@@ -3436,7 +3459,7 @@ async def anthropic_messages(
             err_kind = last_err_kind or "no_account"
             seq = _log_chat_row(None, latency_ms, final_model, "anthropic", "-", 503, None, error_kind=err_kind)
             await _blocking_call(_record_usage, key.id, 0, final_model, 0.0, None,
-                          client_ip=_client_ip(request), use_case="anthropic",
+                          reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="anthropic",
                           seq=seq, latency_ms=latency_ms, error_kind=err_kind)
             if err_kind == "waf":
                 msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
