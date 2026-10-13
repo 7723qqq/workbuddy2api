@@ -1535,6 +1535,19 @@ function uiSelectSet(id, value) {
 const $ = (s) => document.querySelector(s);
 const TOKEN_KEY = "wb_admin_token";
 let TOKEN = localStorage.getItem(TOKEN_KEY) || "";
+// 桌面托盘的「在浏览器中打开」会带一次性 JWT（?token=）：普通浏览器没有 pywebview 桥，
+// ?desktop=1 的免密通道走不通。取到即存 localStorage 并清掉参数，避免 token 留在地址栏/历史里。
+(() => {
+  try {
+    const t = new URLSearchParams(location.search).get("token");
+    if (t) {
+      TOKEN = t; localStorage.setItem(TOKEN_KEY, t);
+      const u = new URL(location.href);
+      u.searchParams.delete("token");
+      history.replaceState(null, "", u.pathname + (u.search || "") + u.hash);
+    }
+  } catch (e) { /* 老浏览器兜底：忽略，走登录表单 */ }
+})();
 
 /* 时间格式化：数据库存的是 UTC，统一 +8 展示为北京时间（与服务器时区无关） */
 function fmtTime(s, withSec = true) {

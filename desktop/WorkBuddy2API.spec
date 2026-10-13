@@ -19,10 +19,12 @@ hidden += ['uvicorn.logging', 'uvicorn.loops.asyncio', 'uvicorn.protocols.http.h
            'uvicorn.lifespan.on', 'sqlalchemy.dialects.sqlite', 'sqlalchemy.dialects.mysql.pymysql',
            'converter', 'anthropic_adapter', 'responses_adapter', 'responses_projection',
            'desensitize', 'upstream_compat', 'wb_install', 'wb_asar', 'wb_envcheck',
-           'webview.platforms.edgechromium', 'webview.platforms.winforms', 'clr', 'pythonnet']
+           'webview.platforms.edgechromium', 'webview.platforms.winforms', 'clr', 'pythonnet',
+           # Tray shell: pystray loads its backend lazily, so collect them explicitly.
+           'pystray._win32', 'pystray._util', 'PIL.Image', 'PIL.ImageDraw', 'PIL._tkinter_finder']
 a = Analysis([str(root / 'desktop_entry.py')], pathex=[str(root)], datas=datas, hiddenimports=hidden,
              excludes=['tkinter', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'cefpython3',
-                       'cairosvg', 'resvg_py', 'PIL', 'numpy', 'scipy', 'matplotlib', 'pytest',
+                       'cairosvg', 'resvg_py', 'numpy', 'scipy', 'matplotlib', 'pytest',
                        'IPython', 'watchfiles', 'websockets', 'httptools'], noarchive=False)
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name=name, debug=False,
