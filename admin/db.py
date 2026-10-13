@@ -168,6 +168,10 @@ def init_db() -> bool:
 
         # 迁移：api_keys 加 group_id 列（绑定模型分组；0=不限制）
         _ensure_column("api_keys", "group_id", "INT", "DEFAULT 0")
+        _ensure_column("api_keys", "account_id", "INT", "NULL")
+        # Ownership must have a database constraint, including concurrent creates.
+        next(i for i in models.ApiKey.__table__.indexes
+             if i.name == "ux_api_keys_account").create(bind=engine, checkfirst=True)
 
         # 迁移：使用记录/日志的查询索引。
         #

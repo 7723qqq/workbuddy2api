@@ -95,6 +95,7 @@ tests/*
 !tests/test_android_http.py
 !tests/test_credentials.py
 !tests/test_account_automation.py
+!tests/test_key_account_binding.py
 !scripts/build_android.py
 android/.gradle/
 android/local.properties

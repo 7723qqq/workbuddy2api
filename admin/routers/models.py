@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from admin import backend
+from admin.account_binding import scope_accounts
 from admin.config import settings
 from admin.db import get_db
 from admin.models import Account, ModelConfig
@@ -104,7 +105,7 @@ def _do_sync_models(db: Session) -> dict:
 
     需要一个有效账号来调用后端 API；优先选 active 且余额 > 0 的账号。
     """
-    acc = db.query(Account).filter(
+    acc = scope_accounts(db.query(Account)).filter(
         Account.status == "active", Account.balance_remain > 0
     ).first()
     if not acc:
@@ -257,7 +258,7 @@ async def speed_test(
     messages = body.get("messages") or _SPEED_TEST_PROMPT
 
     # 选可用账号（与代理一致：active 且余额>0，剩余最多优先）
-    acc = db.query(Account).filter(
+    acc = scope_accounts(db.query(Account)).filter(
         Account.status == "active", Account.balance_remain > 0
     ).order_by(Account.balance_remain.desc()).first()
     if not acc:

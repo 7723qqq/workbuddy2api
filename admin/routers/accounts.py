@@ -13,10 +13,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from admin import backend, jobrunner, wb_login
+from admin.account_binding import binding_owners, scope_accounts
 from admin.credential_codec import CredentialDecodeError, normalize_credential
 from admin.config import settings
 from admin.db import SessionLocal, get_db
-from admin.models import Account, AccountModelCooldown, ModelConfig, UsageLog
+from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, UsageLog
 from admin.security import require_admin
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
@@ -426,6 +427,7 @@ def _credit_fields(a: Account) -> dict:
 @router.get("")
 def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.query(Account).order_by(Account.id.desc()).all()
+    owners = binding_owners(db)
     now = datetime.utcnow()
     limits = _active_model_limits(db, now)
     from admin.post_login import states
@@ -438,6 +440,8 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "enterprise_id": a.enterprise_id,
             "domain": a.domain,
             "status": a.status,
+            "bound_key_id": owners[a.id].id if owners.get(a.id) else None,
+            "bound_key_name": owners[a.id].name if owners.get(a.id) else "",
             "balance_total": a.balance_total,
             "balance_remain": a.balance_remain,
             "last_sync_at": a.last_sync_at.isoformat() if a.last_sync_at else None,
@@ -534,6 +538,7 @@ def model_limits(_: bool = Depends(require_admin), db: Session = Depends(get_db)
     now = datetime.utcnow()
     rows = db.query(Account).all()
     limits = _active_model_limits(db, now)
+    public_ids = {a.id for a in scope_accounts(db.query(Account)).all()}
     start = (now + timedelta(hours=8)).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=8)
     usage = {(account_id, model): {"requests_today": count, "tokens_today": int(tokens or 0)}
              for account_id, model, count, tokens in db.query(
@@ -554,7 +559,7 @@ def model_limits(_: bool = Depends(require_admin), db: Session = Depends(get_db)
         config = configs.get(model)
         free = config is not None and config.credit_multiplier == 0
         blocked = {e["account_id"] for e in items if e["model"] == model}
-        available = [a for a in rows if a.status == "active" and a.id not in blocked
+        available = [a for a in rows if a.id in public_ids and a.status == "active" and a.id not in blocked
                      and _gateway_fields(a, now)["gateway_state"] == "ready"
                      and (free or (a.balance_remain or 0) > 0)
                      and not POOL.inflight.full(a.uid or "", settings.MAX_IN_FLIGHT)]
@@ -720,15 +725,19 @@ def dedupe_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_
     为什么保留最早的那条：使用记录（last_used_at）与既有关联数据都挂在
     老记录上，重复导入产生的新记录这些字段都是空的，删掉损失最小。
     """
-    rows = db.query(Account).order_by(Account.id.asc()).all()
+    rows = db.query(Account).order_by(Account.id.asc()).with_for_update().all()
     groups: dict[str, list[Account]] = {}
     for a in rows:
         if a.uid:
             groups.setdefault(a.uid, []).append(a)
 
     removed: list[dict] = []
+    bound_ids = {k.account_id for k in db.query(ApiKey).filter(ApiKey.account_id.is_not(None)).with_for_update().all()}
     for uid, grp in groups.items():
-        for a in grp[1:]:
+        keep = next((a for a in grp if a.id in bound_ids), grp[0])
+        for a in grp:
+            if a.id == keep.id or a.id in bound_ids:
+                continue
             removed.append({"id": a.id, "name": a.name, "uid": uid})
             db.delete(a)
     db.commit()
@@ -1401,9 +1410,11 @@ def patch_account(
 
 @router.delete("/{acc_id}")
 def delete_account(acc_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    acc = db.query(Account).filter(Account.id == acc_id).first()
+    acc = db.query(Account).filter(Account.id == acc_id).with_for_update().first()
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
+    if db.query(ApiKey).filter(ApiKey.account_id == acc_id).with_for_update().first():
+        raise HTTPException(409, "该账号已绑定 API Key，请先解除绑定再删除")
     db.query(AccountModelCooldown).filter(AccountModelCooldown.account_id == acc_id).delete(synchronize_session=False)
     db.delete(acc)
     db.commit()

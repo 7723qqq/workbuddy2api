@@ -102,6 +102,7 @@ class ApiKey(Base):
     """对外共享的 API Key，带积分限额。"""
 
     __tablename__ = "api_keys"
+    __table_args__ = (Index("ux_api_keys_account", "account_id", unique=True),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(120), default="")
@@ -115,6 +116,8 @@ class ApiKey(Base):
     note = Column(String(255), default="")
     # 绑定的模型分组 id；0 = 未绑定（可用全部启用模型）。分组被删时按 0 处理（自动降级）
     group_id = Column(Integer, default=0)
+    # NULL = public pool; a reservation survives revocation until explicitly released.
+    account_id = Column(Integer, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

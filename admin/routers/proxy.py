@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import anyio
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 from sqlalchemy import or_
@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from admin import backend, pool, model_limits, model_catalog, upstream_http, request_metrics
 from admin import client_profile as cprofile
+from admin.account_binding import scope_accounts
 from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, UsageLog
@@ -1491,7 +1492,7 @@ _CREDIT_RE = re.compile(r"x\s*([0-9]+(?:\.[0-9]+)?)")
 
 def _transient_cool_fallback(db: Session, exclude_ids: set | None,
                              min_balance: int, now: datetime,
-                             limit: int = 5) -> list:
+                             limit: int = 5, account_id=None, key_id=None) -> list:
     """整池都在临时冷却时的兜底候选（冷却最早到期的前 `limit` 个）。
 
     只在 `_select_account` 的严格过滤结果为空时调用。语义是「退一档，
@@ -1510,6 +1511,7 @@ def _transient_cool_fallback(db: Session, exclude_ids: set | None,
     q = (db.query(Account)
            .filter(Account.status == "active",
                    Account.cool_kind.in_(tuple(_TRANSIENT_COOL_KINDS))))
+    q = scope_accounts(q, account_id, key_id)
     if min_balance > 0:
         q = q.filter(Account.balance_remain > 0)
     if exclude_ids:
@@ -1519,7 +1521,7 @@ def _transient_cool_fallback(db: Session, exclude_ids: set | None,
     return q.order_by(Account.cool_until.asc()).limit(limit).all()
 
 
-def _no_account_reason(db: Session) -> str:
+def _no_account_reason(db: Session, account_id=None, key_id=None) -> str:
     """`_select_account` 选不出号时，给出一句**如实**的原因。
 
     原实现固定回「全部禁用或额度耗尽」。这句话在「整池只是被上游临时限流」
@@ -1528,9 +1530,11 @@ def _no_account_reason(db: Session) -> str:
     却被这句话误导成额度问题。
     """
     now = datetime.utcnow()
-    accs = db.query(Account).all()
+    accs = scope_accounts(db.query(Account), account_id, key_id).all()
     if not accs:
-        return "号池为空（还没有添加任何账号）"
+        if account_id:
+            return "绑定账号不存在或绑定已变更；该 Key 不会使用公共账号"
+        return "公共账号池为空（账号可能已被 API Key 独占绑定）"
     active = [a for a in accs if (a.status or "") == "active"]
     if not active:
         return f"全部 {len(accs)} 个账号都已禁用"
@@ -1588,7 +1592,7 @@ def _looks_login_dead(acc: Account, now: datetime) -> bool:
 def _select_account(db: Session, exclude_ids: set | None = None,
                     min_balance: int = 1, mark_picked: bool = True,
                     model: str = "", sticky_key: str = "",
-                    require_realm: str = "") -> Account | None:
+                    require_realm: str = "", account_id=None, key_id=None) -> Account | None:
     """从健康账号池中挑选一个账号。
 
     选号 = 会话粘性（命中即定）→ 健康过滤 → **到期紧迫度（硬优先）** →
@@ -1628,6 +1632,7 @@ def _select_account(db: Session, exclude_ids: set | None = None,
             free_model = True
             min_balance = 0
     q = db.query(Account).filter(Account.status == "active")
+    q = scope_accounts(q, account_id, key_id)
     if min_balance > 0:
         q = q.filter(Account.balance_remain > 0)
     if exclude_ids:
@@ -1646,7 +1651,8 @@ def _select_account(db: Session, exclude_ids: set | None = None,
         # 而是退一档：把冷却最早到期、且阻塞原因只是临时限流的号拿来做候选。
         # 14003 这类「请求过于频繁」很可能已经自然恢复；即便没恢复，
         # 试一次也远好于给用户一个必然失败的 503。
-        rows = _transient_cool_fallback(db, exclude_ids, min_balance, now)
+        rows = _transient_cool_fallback(db, exclude_ids, min_balance, now,
+                                        account_id=account_id, key_id=key_id)
         if rows:
             _logger.warning(
                 "号池全部处于临时冷却中，启用兜底候选 %d 个（最早的 %s 到期）",
@@ -1809,6 +1815,42 @@ def _model_out_of_group_error(model: str) -> JSONResponse:
             "code": "model_not_in_group",
         }},
     )
+
+
+def _key_allowed_models(db: Session, key) -> set[str] | None:
+    allowed = _key_group_models(db, key)
+    aid = getattr(key, "account_id", None)
+    if not aid:
+        return allowed
+    acc = scope_accounts(db.query(Account), aid, key.id).first()
+    if acc is None or acc.status != "active":
+        raise HTTPException(503, {"error": {"message": "绑定账号不存在或已禁用，该 Key 无法使用公共池",
+                                           "type": "bound_account_unavailable"}})
+    try:
+        def fetch():
+            with backend.AccountSession(acc.auth_json) as sess:
+                rows = sess.fetch_models()
+                acc.auth_json = sess.updated_json()
+            db.commit()
+            return rows
+        rows = model_catalog.get_models(acc.auth_json, settings.BACKEND, fetch)
+    except Exception:
+        db.rollback()
+        raise HTTPException(503, {"error": {"message": "无法获取绑定账号的模型权益，请稍后重试",
+                                           "type": "bound_account_unavailable"}}) from None
+    entitled = {m["id"] for m in rows or [] if m.get("id") and m["id"].lower() != "auto"}
+    configs = db.query(ModelConfig).all()
+    if configs:
+        entitled &= {c.model_id for c in configs if c.enabled}
+    return entitled if allowed is None else entitled & allowed
+
+
+def _model_access_error(key, model):
+    if getattr(key, "account_id", None):
+        return JSONResponse(status_code=403, content={"error": {
+            "message": f"模型 '{model}' 不在该 Key 绑定账号的模型权益或允许分组内",
+            "type": "model_not_entitled", "code": "model_not_entitled"}})
+    return _model_out_of_group_error(model)
 
 
 def _pick_best_model(db: Session, requested_model: str,
@@ -2102,6 +2144,8 @@ def _map_anthropic_model(db: Session, model: str, key: "ApiKey | None" = None) -
     m = (model or "").strip()
     if not m or m == "auto":
         return "auto"
+    if getattr(key, "account_id", None) and not m.lower().startswith("claude-"):
+        return m  # Concrete upstream IDs must pass the account entitlement check.
     if allowed is not None:
         if m in allowed:
             return m
@@ -2146,11 +2190,11 @@ async def chat_completions(
     model = payload.get("model", "auto")
 
     # 模型白名单检查 + 免费优先选择（绑定了分组的 Key 只在组内选择）
-    allowed = await _blocking_call(_key_group_models, db, key)
+    allowed = await _blocking_call(_key_allowed_models, db, key)
     resolved_model = await _blocking_call(_pick_best_model, db, model, allowed)
     if resolved_model is None:
         if allowed is not None and model not in ("auto", ""):
-            return _model_out_of_group_error(model)
+            return _model_access_error(key, model)
         return JSONResponse(
             status_code=400,
             content={"error": {"message": f"模型 '{model}' 不存在或已被禁用", "type": "model_not_found"}},
@@ -2230,7 +2274,8 @@ async def chat_completions(
                         if not retry_budget.available():
                             break
                         acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
-                                                model=m, sticky_key=sticky_key)
+                                                model=m, sticky_key=sticky_key,
+                                                account_id=getattr(key, "account_id", None), key_id=key.id)
                         if not acc_i:
                             break
                         tried_ids.add(acc_i.id)
@@ -2648,11 +2693,11 @@ async def responses_proxy(
     chat_body["stream_options"] = opts
 
     requested = payload.get("model", "auto")
-    allowed = await _blocking_call(_key_group_models, db, key)
+    allowed = await _blocking_call(_key_allowed_models, db, key)
     resolved = await _blocking_call(_pick_best_model, db, requested, allowed)
     if resolved is None:
         if allowed is not None and requested not in ("auto", ""):
-            return _model_out_of_group_error(requested)
+            return _model_access_error(key, requested)
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
@@ -2693,7 +2738,8 @@ async def responses_proxy(
                     if not retry_budget.available():
                         break
                     acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
-                                            model=m, sticky_key=sticky_key)
+                                            model=m, sticky_key=sticky_key,
+                                                account_id=getattr(key, "account_id", None), key_id=key.id)
                     if not acc_i:
                         break
                     tried_ids.add(acc_i.id)
@@ -2845,7 +2891,8 @@ async def responses_proxy(
                         if not retry_budget.available():
                             break
                         acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
-                                                model=m, sticky_key=sticky_key)
+                                                model=m, sticky_key=sticky_key,
+                                                account_id=getattr(key, "account_id", None), key_id=key.id)
                         if not acc_i:
                             break
                         tried_ids.add(acc_i.id)
@@ -3095,11 +3142,11 @@ async def anthropic_messages(
             _logger.warning("harness 脱敏失败，按原样发送：%s", e)
 
     requested = await _blocking_call(_map_anthropic_model, db, payload.get("model", "auto"), key)
-    allowed = await _blocking_call(_key_group_models, db, key)
+    allowed = await _blocking_call(_key_allowed_models, db, key)
     resolved = await _blocking_call(_pick_best_model, db, requested, allowed)
     if resolved is None:
         if allowed is not None and requested not in ("auto", ""):
-            return _model_out_of_group_error(requested)
+            return _model_access_error(key, requested)
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
@@ -3148,7 +3195,8 @@ async def anthropic_messages(
                     if not retry_budget.available():
                         break
                     acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
-                                            model=m, sticky_key=sticky_key)
+                                            model=m, sticky_key=sticky_key,
+                                                account_id=getattr(key, "account_id", None), key_id=key.id)
                     if not acc_i:
                         break
                     tried_ids.add(acc_i.id)
@@ -3303,7 +3351,8 @@ async def anthropic_messages(
                         if not retry_budget.available():
                             break
                         acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
-                                                model=m, sticky_key=sticky_key)
+                                                model=m, sticky_key=sticky_key,
+                                                account_id=getattr(key, "account_id", None), key_id=key.id)
                         if not acc_i:
                             break
                         tried_ids.add(acc_i.id)
@@ -3546,16 +3595,17 @@ def models(
     except Exception as e:
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
-    acc = _select_account(db)
+    aid = getattr(key, "account_id", None)
+    acc = _select_account(db, account_id=aid, key_id=key.id, min_balance=0)
     if not acc:
         return JSONResponse(status_code=503,
-                            content={"error": {"message": f"无可用账号：{_no_account_reason(db)}",
+                            content={"error": {"message": f"无可用账号：{_no_account_reason(db, aid, key.id)}",
                                                "type": "no_account"}})
     # 绑定了分组的 Key 只应看到组内模型，否则客户端会照着完整列表点模型然后被 403
-    allowed = _key_group_models(db, key)
+    allowed = _key_allowed_models(db, key)
     configs = db.query(ModelConfig).all()
     enabled_ids = {row.model_id for row in configs if row.enabled}
-    if os.getenv("WORKBUDDY_ANDROID") == "1":
+    if os.getenv("WORKBUDDY_ANDROID") == "1" and not aid:
         # Reuse the local model rules also displayed in the admin model screen.
         if configs:
             data = [{'id': row.model_id, 'object': 'model', 'owned_by': 'codebuddy',
@@ -3627,8 +3677,8 @@ def models(
             # 换一个号再试（排除已失败的）。
             # 第二次放宽 min_balance：模型列表不消耗积分，
             # 余额为 0 的号也能正常列模型，不该因此被排除。
-            acc = (_select_account(db, exclude_ids=tried_ids)
-                   or _select_account(db, exclude_ids=tried_ids, min_balance=0))
+            acc = (_select_account(db, exclude_ids=tried_ids, account_id=aid, key_id=key.id)
+                   or _select_account(db, exclude_ids=tried_ids, min_balance=0, account_id=aid, key_id=key.id))
     return JSONResponse(status_code=502, content={
         "error": {"message": f"获取模型失败（已尝试 {len(tried_ids)} 个账号）：{last_err[:200]}",
                   "type": "upstream"}})

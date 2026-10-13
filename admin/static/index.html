@@ -2108,6 +2108,7 @@ function accRow(a) {
       <div class="nm">
         <b title="${esc(a.name || "未命名")}">${esc(a.name || "未命名")}</b>
         <span class="c-uid" title="${esc(a.uid || "")}">${esc(a.uid || "-")}</span>
+        ${a.bound_key_id ? `<small class="text-indigo-600">Key 独占：${esc(a.bound_key_name || ("#" + a.bound_key_id))}</small>` : ''}
         ${a.post_login_automation ? `<small style="color:var(--fg-muted)" title="${esc((a.post_login_automation.result?.errors || []).join('；'))}">${esc(({queued:'自动任务排队中',running:'自动任务执行中',completed:'自动任务已完成',failed:'部分自动任务未完成'})[a.post_login_automation.status] || '')}</small>` : ''}
       </div>
     </td>
@@ -3787,7 +3788,7 @@ async function submitAddAccount(){
 function keyRow(k) {
   return `
     <tr class="border-t hover:bg-slate-50">
-      <td class="px-4 py-3">${esc(k.name||"未命名")}</td>
+      <td class="px-4 py-3">${esc(k.name||"未命名")}<div class="text-xs text-slate-400 mt-1">${k.account_id ? `独占账号：${esc(k.account_name || ("#" + k.account_id))}` : "公共账号池"}</div></td>
       <td class="px-4 py-3 font-mono text-xs text-slate-500">${esc(k.masked)}</td>
       <td class="px-4 py-3">${k.unlimited?"∞":k.credit_limit}</td>
       <td class="px-4 py-3 ${k.credit_used>=k.credit_limit&&!k.unlimited?'text-red-500':''}">${k.credit_used}</td>
@@ -3858,7 +3859,25 @@ function renderKeyPage(p) {
     `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的 Key" : "还没有 Key，点「创建 Key」"}</td></tr>`;
   $("#keyPager").innerHTML = pagerHtml(total, p, totalPages, "renderKeyPage");
 }
+async function keyAccountOptions(key) {
+  const r = await api("/api/accounts");
+  const { ok, data } = await safeJson(r);
+  if (!ok) throw new Error("账号列表加载失败，请重试");
+  const options = [{ value: "0", label: "不绑定（使用公共账号池）" }].concat(
+    (data.items || []).filter(a => !a.bound_key_id || a.bound_key_id === key?.id)
+      .map(a => ({ value: String(a.id), label: `${a.name || a.uid || "账号"} #${a.id} · ${a.balance_remain} 积分${a.status !== "active" ? " · 已禁用" : ""}` })));
+  if (key?.account_id && !options.some(o => o.value === String(key.account_id)))
+    options.push({ value: String(key.account_id), label: `原绑定账号 #${key.account_id}（不存在）` });
+  return options;
+}
+function keyAccountSelect(id, options, value = 0) {
+  return `<div class="mb-3"><label class="text-xs text-slate-500">独占绑定账号（可选）</label>
+    <div class="mt-1">${uiSelectHTML(id, { value: String(value || 0), options })}</div>
+    <p class="text-[11px] text-slate-400 mt-1">绑定后公共池跳过该账号；此 Key 仅使用该账号的积分和模型权益，账号不可用时不会换到其他账号。停用 Key 保留绑定，解绑或删除 Key 释放账号。</p></div>`;
+}
 async function openAddKey(){
+  let accountOptions;
+  try { accountOptions = await keyAccountOptions(); } catch(e) { toast(e.message, "err"); return; }
   // 拉一次分组列表填下拉；失败不阻塞创建（下拉退化为「不限制」）
   let groups = [];
   try {
@@ -3882,6 +3901,7 @@ async function openAddKey(){
       })}</div>
       <p class="text-[11px] text-slate-400 mt-1">选择后该 Key 只能调用组内模型，调用组外模型返回 403。</p>
     </div>
+    ${keyAccountSelect("kAccount", accountOptions)}
     <input id="kNote" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="备注（可选）" />
     <div class="flex justify-end gap-2 mt-2">
       <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
@@ -3890,7 +3910,7 @@ async function openAddKey(){
 }
 async function submitAddKey(){
   const unlimited = $("#kUnlimited").checked;
-  const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"", group_id: Number(uiSelectValue("kGroup")||0) };
+  const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"", group_id: Number(uiSelectValue("kGroup")||0), account_id: Number(uiSelectValue("kAccount")||0) };
   const r = await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d = await r.json().catch(()=>({}));
   if(r.ok){
@@ -3898,7 +3918,7 @@ async function submitAddKey(){
       <p class="text-xs text-slate-500 mb-2">可随时在列表中点击「眼睛」图标再次查看：</p>
       <div class="flex gap-2"><input id="newKey" readonly class="w-full border rounded-lg px-2 py-2 text-xs font-mono" value="${esc(d.key)}"><button onclick="copyText('#newKey')" class="px-3 bg-wb text-white rounded-lg text-sm">复制</button></div>
       <div class="flex justify-end mt-4"><button onclick="closeModal();loadKeys()" class="px-3 py-1.5 rounded-lg border text-sm">完成</button></div>`);
-  } else { toast("创建失败","err"); }
+  } else { toast("创建失败：" + (d.detail || "未知错误"),"err"); }
 }
 async function viewKeyFull(id, name){
   openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-eye mr-1"></i> 查看 Key — ${esc(name)}</h3><p class="text-xs text-slate-400 mb-3">加载中...</p><div id="keyFullBody"></div>
@@ -3937,6 +3957,8 @@ async function editKey(id){
   const k = _keyData.find(x => x.id === id);
   if (!k) { toast("Key 不存在", "err"); return; }
 
+  let accountOptions;
+  try { accountOptions = await keyAccountOptions(k); } catch(e) { toast(e.message, "err"); return; }
   // 分组下拉数据；拉取失败也不阻塞编辑（退化为仅「不限制」）
   let groups = [];
   try {
@@ -3958,6 +3980,7 @@ async function editKey(id){
     })}</div>
     <p class="text-[11px] text-slate-400 -mt-2 mb-3">不限制 = 可用全部启用模型；选了分组则只能调用组内模型。</p>
 
+    ${keyAccountSelect("ekAccount", accountOptions, k.account_id)}
     <label class="block text-xs text-slate-500 mb-1">积分限额（credits）</label>
     <input id="ekLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" value="${k.unlimited ? 0 : k.credit_limit}" placeholder="积分限额" />
     <label class="flex items-center gap-2 text-sm mb-1"><input id="ekUnlimited" type="checkbox" ${k.unlimited ? "checked" : ""} /> 不限额（∞）</label>
@@ -3973,6 +3996,7 @@ async function submitEditKey(id){
   const body = {
     name,
     group_id: Number(uiSelectValue("ekGroup") || 0),
+    account_id: Number(uiSelectValue("ekAccount") || 0),
     credit_limit: Number($("#ekLimit").value || 0),
     unlimited: $("#ekUnlimited").checked,
     reset_used: $("#ekReset").checked,
@@ -3980,7 +4004,7 @@ async function submitEditKey(id){
   const r = await api("/api/keys/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const { ok, data: d } = await safeJson(r);
   if (!ok) { toast("保存失败: " + (d.detail || "未知错误"), "err"); return; }
-  closeModal(); toast("已保存"); loadKeys(); loadGroups();
+  closeModal(); toast("已保存"); loadKeys(); loadGroups(); loadAccounts();
 }
 async function deleteKey(id){ if(!await uiConfirm({message:"确认删除该 Key？此操作不可恢复。", title:"删除 API Key"}))return; const r=await api("/api/keys/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"删除失败", r.ok?"ok":"err"); if(r.ok) loadKeys(); }
 

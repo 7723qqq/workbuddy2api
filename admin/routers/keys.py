@@ -4,10 +4,12 @@ import secrets
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from admin.account_binding import validate_binding
 from admin.db import get_db
-from admin.models import ApiKey, ModelGroup
+from admin.models import Account, ApiKey, ModelGroup
 from admin.security import hash_key, require_admin
 
 router = APIRouter(prefix="/api/keys", tags=["keys"])
@@ -19,6 +21,7 @@ class KeyIn(BaseModel):
     unlimited: bool = False
     note: str = ""
     group_id: int = 0  # 0 = 不绑定分组（可用全部启用模型）
+    account_id: int | None = None  # 0 / NULL = 公共池
 
 
 def _gen_key() -> str:
@@ -46,6 +49,7 @@ def _decode_key(encoded: str) -> str:
 def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.query(ApiKey).order_by(ApiKey.id.desc()).all()
     group_names = {g.id: g.name for g in db.query(ModelGroup).all()}
+    account_names = {a.id: a.name or a.uid for a in db.query(Account).all()}
     items = [
         {
             "id": k.id,
@@ -59,6 +63,8 @@ def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
             "note": k.note,
             "group_id": int(k.group_id or 0),
             "group_name": group_names.get(int(k.group_id or 0), ""),
+            "account_id": k.account_id,
+            "account_name": account_names.get(k.account_id, ""),
             "created_at": k.created_at.isoformat() if k.created_at else None,
         }
         for k in rows
@@ -78,6 +84,7 @@ def _validate_group(db: Session, group_id: int) -> int:
 def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
     raw = _gen_key()
     gid = _validate_group(db, body.group_id)
+    aid = validate_binding(db, body.account_id)
     k = ApiKey(
         name=body.name or "未命名",
         key_hash=hash_key(raw),
@@ -87,9 +94,10 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         unlimited=1 if body.unlimited else 0,
         note=body.note,
         group_id=gid,
+        account_id=aid,
     )
     db.add(k)
-    db.commit()
+    _commit_key(db)
     db.refresh(k)
     # 明文 key 仅此返回一次
     return {
@@ -100,6 +108,7 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         "credit_limit": k.credit_limit,
         "unlimited": bool(k.unlimited),
         "group_id": int(k.group_id or 0),
+        "account_id": k.account_id,
     }
 
 
@@ -146,6 +155,8 @@ def patch_key(key_id: int, body: dict, _: bool = Depends(require_admin), db: Ses
     k = db.query(ApiKey).filter(ApiKey.id == key_id).first()
     if not k:
         raise HTTPException(status_code=404, detail="Key 不存在")
+    if "account_id" in body:
+        k.account_id = validate_binding(db, body["account_id"], key_id)
     if "name" in body:
         k.name = body["name"]
     if "credit_limit" in body:
@@ -160,8 +171,16 @@ def patch_key(key_id: int, body: dict, _: bool = Depends(require_admin), db: Ses
         k.group_id = _validate_group(db, body["group_id"])
     if body.get("reset_used"):
         k.credit_used = 0
-    db.commit()
+    _commit_key(db)
     return {"id": k.id, "ok": True}
+
+
+def _commit_key(db):
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该账号已被其他 API Key 独占绑定，请刷新后重试") from None
 
 
 @router.delete("/{key_id}")
