@@ -906,7 +906,7 @@
           <thead class="bg-slate-50 text-slate-500 text-left sticky top-0">
             <tr>
               <th class="px-4 py-3">名称</th><th class="px-4 py-3">Key</th><th class="px-4 py-3">限额</th>
-              <th class="px-4 py-3">已用</th><th class="px-4 py-3">分组</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th>
+              <th class="px-4 py-3">已用</th><th class="px-4 py-3">并发</th><th class="px-4 py-3">分组</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody id="keyBody"></tbody>
@@ -3800,6 +3800,7 @@ function keyRow(k) {
       <td class="px-4 py-3 font-mono text-xs text-slate-500">${esc(k.masked)}</td>
       <td class="px-4 py-3">${k.unlimited?"∞":k.credit_limit}</td>
       <td class="px-4 py-3 ${k.credit_used>=k.credit_limit&&!k.unlimited?'text-red-500':''}">${k.credit_used}</td>
+      <td class="px-4 py-3" title="key 并发≠账号在途上限（ADMIN_POOL_MAX_IN_FLIGHT）">${k.max_concurrent===0?'不限':(k.max_concurrent==null?'全局':k.max_concurrent)}</td>
       <td class="px-4 py-3">${k.group_name
           ? `<span class="badge bg-indigo-100 text-indigo-700" title="仅可用该分组内模型">${esc(k.group_name)}</span>`
           : `<span class="text-xs text-slate-300" title="不限制，可用全部启用模型">全部模型</span>`}</td>
@@ -3900,6 +3901,8 @@ async function openAddKey(){
     <input id="kName" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="名称（可选）" />
     <label class="flex items-center gap-2 text-sm mb-2"><input id="kUnlimited" type="checkbox" /> 不限额（∞）</label>
     <input id="kLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="积分限额（credits）" />
+    <input id="kMaxConcurrent" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-1 text-sm" placeholder="并发上限（空=全局，0=不限）" title="key 并发≠账号在途上限（ADMIN_POOL_MAX_IN_FLIGHT）" />
+    <p class="text-[11px] text-slate-400 mb-2">并发：空=全局默认；0=不限；N=最多 N 路。与账号在途上限相互独立。</p>
     <div class="mb-2">
       <label class="text-xs text-slate-500">模型分组（可选）</label>
       <div class="mt-1">${uiSelectHTML("kGroup", {
@@ -3918,7 +3921,9 @@ async function openAddKey(){
 }
 async function submitAddKey(){
   const unlimited = $("#kUnlimited").checked;
-  const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"", group_id: Number(uiSelectValue("kGroup")||0), account_id: Number(uiSelectValue("kAccount")||0) };
+  const mcRaw = $("#kMaxConcurrent").value;
+  const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"", group_id: Number(uiSelectValue("kGroup")||0), account_id: Number(uiSelectValue("kAccount")||0),
+    max_concurrent: mcRaw === "" ? null : Number(mcRaw) };
   const r = await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d = await r.json().catch(()=>({}));
   if(r.ok){
@@ -3994,6 +3999,10 @@ async function editKey(id){
     <label class="flex items-center gap-2 text-sm mb-1"><input id="ekUnlimited" type="checkbox" ${k.unlimited ? "checked" : ""} /> 不限额（∞）</label>
     <label class="flex items-center gap-2 text-sm mb-2"><input id="ekReset" type="checkbox" /> 重置已用额度（当前 ${k.credit_used}）</label>
 
+    <label class="block text-xs text-slate-500 mb-1">并发上限</label>
+    <input id="ekMaxConcurrent" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-1 text-sm" value="${k.max_concurrent == null ? "" : k.max_concurrent}" placeholder="空=全局，0=不限" title="key 并发≠账号在途上限（ADMIN_POOL_MAX_IN_FLIGHT）" />
+    <p class="text-[11px] text-slate-400 mb-2">空=全局默认；0=不限；N=最多 N 路。与账号在途上限相互独立。</p>
+
     <div class="flex justify-end gap-2 mt-2"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
     <button onclick="submitEditKey(${id})" class="px-3 py-1.5 rounded-lg btn-primary">保存</button></div>`);
 }
@@ -4001,12 +4010,14 @@ async function editKey(id){
 async function submitEditKey(id){
   const name = ($("#ekName").value || "").trim();
   if (!name) { toast("名称不能为空", "err"); return; }
+  const mcRaw = $("#ekMaxConcurrent").value;
   const body = {
     name,
     group_id: Number(uiSelectValue("ekGroup") || 0),
     account_id: Number(uiSelectValue("ekAccount") || 0),
     credit_limit: Number($("#ekLimit").value || 0),
     unlimited: $("#ekUnlimited").checked,
+    max_concurrent: mcRaw === "" ? null : Number(mcRaw),
     reset_used: $("#ekReset").checked,
   };
   const r = await api("/api/keys/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});

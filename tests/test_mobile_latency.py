@@ -246,14 +246,14 @@ class MobileLatencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_level_cancellation_during_admission_returns_late_granted_slot(self):
         ready = threading.Event()
         lease = gateway_limits.Admission('offline-test')
-        def allow(key):
+        def allow(key, rate=None, concurrent=None):
             ready.set()
             time.sleep(.1)
             return lease
         async def app(*args):
             self.fail('cancelled request must not enter app')
         with patch.object(gateway_limits, '_limits', return_value=(1,1)), \
-                patch.object(gateway_limits, '_valid_key_id', return_value='offline-test'), \
+                patch.object(gateway_limits, '_key_admission_params', return_value=('offline-test', 1, 1)), \
                 patch.object(gateway_limits, 'allow', side_effect=allow), \
                 patch.object(gateway_limits, 'release') as release:
             async with anyio.create_task_group() as group:

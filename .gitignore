@@ -98,6 +98,7 @@ tests/*
 !tests/test_key_account_binding.py
 !tests/test_anthropic_tool_pairing.py
 !tests/test_desensitize_user_payload.py
+!tests/test_key_concurrent_limit.py
 !scripts/build_android.py
 android/.gradle/
 android/local.properties

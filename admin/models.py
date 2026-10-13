@@ -112,6 +112,9 @@ class ApiKey(Base):
     credit_limit = Column(Float, default=0)  # 限额（credits）；unlimited=True 时忽略
     credit_used = Column(Float, default=0)
     unlimited = Column(Integer, default=0)  # 0/1
+    # 该 Key 并发上限：NULL=跟随全局 ADMIN_GATEWAY_MAX_CONCURRENT；0=不限；N=最多 N 路在途
+    # 注意：这是准入层限制，与账号层 ADMIN_POOL_MAX_IN_FLIGHT（防单号雪崩）相互独立。
+    max_concurrent = Column(Integer, nullable=True, default=None)
     status = Column(String(16), default="active")  # active | revoked
     note = Column(String(255), default="")
     # 绑定的模型分组 id；0 = 未绑定（可用全部启用模型）。分组被删时按 0 处理（自动降级）

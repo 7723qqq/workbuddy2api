@@ -22,6 +22,8 @@ class KeyIn(BaseModel):
     note: str = ""
     group_id: int = 0  # 0 = 不绑定分组（可用全部启用模型）
     account_id: int | None = None  # 0 / NULL = 公共池
+    # 该 Key 并发上限：None=跟随全局；0=不限；N=最多 N 路在途
+    max_concurrent: int | None = None
 
 
 def _gen_key() -> str:
@@ -59,6 +61,7 @@ def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
             "credit_limit": k.credit_limit,
             "credit_used": k.credit_used,
             "unlimited": bool(k.unlimited),
+            "max_concurrent": k.max_concurrent,
             "status": k.status,
             "note": k.note,
             "group_id": int(k.group_id or 0),
@@ -70,6 +73,17 @@ def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
         for k in rows
     ]
     return {"items": items}
+
+
+def _normalize_max_concurrent(value) -> int | None:
+    """规范化并发上限：None=跟随全局；0=不限；N>=1=最多 N 路。非法值回退 None。"""
+    if value is None or value == "":
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
 
 
 def _validate_group(db: Session, group_id: int) -> int:
@@ -92,6 +106,7 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         key_full=_encode_key(raw),
         credit_limit=body.credit_limit,
         unlimited=1 if body.unlimited else 0,
+        max_concurrent=_normalize_max_concurrent(body.max_concurrent),
         note=body.note,
         group_id=gid,
         account_id=aid,
@@ -107,6 +122,7 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         "key_prefix": k.key_prefix,
         "credit_limit": k.credit_limit,
         "unlimited": bool(k.unlimited),
+        "max_concurrent": k.max_concurrent,
         "group_id": int(k.group_id or 0),
         "account_id": k.account_id,
     }
@@ -163,6 +179,8 @@ def patch_key(key_id: int, body: dict, _: bool = Depends(require_admin), db: Ses
         k.credit_limit = float(body["credit_limit"])
     if "unlimited" in body:
         k.unlimited = 1 if body["unlimited"] else 0
+    if "max_concurrent" in body:
+        k.max_concurrent = _normalize_max_concurrent(body["max_concurrent"])
     if "status" in body and body["status"] in ("active", "revoked"):
         k.status = body["status"]
     if "note" in body:
