@@ -209,7 +209,8 @@ def parse_auth_meta(auth_json: str) -> dict:
         "uid": str(acct.get("uid") or ""),
         "enterprise_id": str(acct.get("enterpriseId") or ""),
         "domain": str(auth.get("domain") or ""),
-        "nickname": str(acct.get("nickname") or ""),
+        # An encrypted wrapper is not a nickname and must never reach the UI.
+        "nickname": acct.get("nickname") if isinstance(acct.get("nickname"), str) else "",
     }
 
 

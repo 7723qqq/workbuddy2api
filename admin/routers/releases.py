@@ -9,7 +9,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import FileResponse
 from admin.security import require_admin
 from desktop.common import ROOT, VERSION, RELEASES_URL
-from desktop.updates import UpdateService
 
 router = APIRouter(prefix="/api/app", tags=["releases"])
 
@@ -43,6 +42,17 @@ def desktop_ready(x_desktop_boot: str = Header(default="")):
 @lru_cache(maxsize=1)
 def service():
     # The server version never downloads or installs executables.
+    # Existing source environments may not yet have update-only dependencies.
+    # A missing version parser must not prevent the API gateway from starting.
+    try:
+        from desktop.updates import UpdateService
+    except ModuleNotFoundError as exc:
+        if exc.name != "packaging" and not (exc.name or "").startswith("packaging."):
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail="检查更新不可用：缺少 packaging，请用运行服务的 Python 执行 python -m pip install -r requirements.txt",
+        ) from exc
     base = Path(tempfile.gettempdir()) / "workbuddy2api-releases"
     base.mkdir(exist_ok=True)
     return UpdateService(base)

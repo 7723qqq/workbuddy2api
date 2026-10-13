@@ -8,11 +8,12 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from admin import backend, jobrunner, wb_login
+from admin.credential_codec import CredentialDecodeError, normalize_credential
 from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account, AccountModelCooldown, ModelConfig, UsageLog
@@ -24,6 +25,14 @@ router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 class AccountIn(BaseModel):
     name: Optional[str] = None  # 留空则自动取真实昵称 / uid
     auth_json: str
+
+    @validator('name', pre=True)
+    def encrypted_name_is_not_a_label(cls, value):
+        # Older browser pages submit account.nickname directly. The decrypted
+        # credential/upstream profile supplies the real name after decoding.
+        if isinstance(value, dict) and value.get('$wbEncrypted') == 1 and isinstance(value.get('envelope'), str):
+            return None
+        return value
 
 
 class AccountBatchIn(BaseModel):
@@ -78,6 +87,15 @@ def _reject_non_credential(auth_json: str) -> dict:
             "step": "validate",
         })
     return check.meta
+
+
+def _decode_or_400(auth_json: str) -> str:
+    try:
+        return normalize_credential(auth_json)
+    except CredentialDecodeError as exc:
+        raise HTTPException(status_code=400, detail={
+            'message': str(exc), 'step': 'decrypt',
+        }) from None
 
 
 def _verify_credential_live_or_400(auth_json: str):
@@ -564,6 +582,7 @@ def clear_model_limit(acc_id: int, body: ClearModelLimit,
 
 @router.post("")
 def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    body.auth_json = _decode_or_400(body.auth_json)
     # 第一道：只收「auth 之后的授权 JSON」，非凭证一律 400
     _reject_non_credential(body.auth_json)
     # 第二道：**真调上游**确认凭证可用、非伪造，并取回真实账号信息 + 余额
@@ -611,6 +630,11 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
     seen = _existing_uid_index(db)
     for it in body.items:
         if not it.auth_json or not it.auth_json.strip():
+            continue
+        try:
+            it.auth_json = normalize_credential(it.auth_json)
+        except CredentialDecodeError as exc:
+            errors.append(f"跳过一条：{exc}")
             continue
         # 第一道：非凭证拒收（与单条上传、与手机号登录共用同一校验器）
         chk = wb_login.validate_credential(it.auth_json)
@@ -722,7 +746,8 @@ def scan_local(_: bool = Depends(require_admin)):
     active_file = os.path.join(d, "workbuddy-desktop.info")
     if os.path.exists(active_file):
         try:
-            active_uid = (json.load(open(active_file, encoding="utf-8")).get("account") or {}).get("uid")
+            with open(active_file, encoding="utf-8-sig") as source:
+                active_uid = (json.load(source).get("account") or {}).get("uid")
         except Exception:
             pass
     items = []
@@ -732,9 +757,15 @@ def scan_local(_: bool = Depends(require_admin)):
         if base.endswith(".bak") or ".bak-" in base:
             continue
         try:
-            data = json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8-sig") as source:
+                data = json.load(source)
         except Exception:
             continue
+        credential_error = ''
+        try:
+            data = json.loads(normalize_credential(json.dumps(data)))
+        except CredentialDecodeError as exc:
+            credential_error = str(exc)
         meta = backend.parse_auth_meta(json.dumps(data))
         uid = meta.get("uid") or ""
         # 同 uid 只保留一份（优先保留无时间戳后缀的"实时登录"文件）
@@ -761,6 +792,7 @@ def scan_local(_: bool = Depends(require_admin)):
             "is_active": (uid == active_uid),
             "expires_at": expires_str,
             "expires_ts": expires_at,
+            "credential_error": credential_error,
         })
     return {"dir": d, "exists": True, "active_uid": active_uid, "items": items}
 
@@ -787,9 +819,15 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
             errors.append(f"文件不存在: {name}")
             continue
         try:
-            auth = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8-sig") as source:
+                auth = source.read()
         except Exception:
             errors.append(f"{name}: 读取失败")
+            continue
+        try:
+            auth = normalize_credential(auth)
+        except CredentialDecodeError as exc:
+            errors.append(f"{name}: {exc}")
             continue
         # 目录里的 *.info 未必都是凭证（可能有半截文件 / 别的 JSON），
         # 与上传入口用同一个校验器把关，避免把垃圾读进号池。
