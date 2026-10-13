@@ -96,6 +96,9 @@ tests/*
 !tests/test_credentials.py
 !tests/test_account_automation.py
 !tests/test_key_account_binding.py
+!tests/test_anthropic_tool_pairing.py
+!tests/test_desensitize_user_payload.py
+!tests/test_key_concurrent_limit.py
 !scripts/build_android.py
 android/.gradle/
 android/local.properties
@@ -103,3 +106,11 @@ android/**/build/
 *.jks
 *.keystore
 
+
+# Local SQLite databases (runtime data)
+workbuddy_admin.db
+workbuddy_admin.db-shm
+workbuddy_admin.db-wal
+
+# Local credentials file
+登录密码.txt

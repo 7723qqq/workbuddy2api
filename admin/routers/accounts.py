@@ -588,6 +588,35 @@ def clear_model_limit(acc_id: int, body: ClearModelLimit,
     return {"ok": True, "cleared": count}
 
 
+@router.post("/{acc_id}/cooldown/clear")
+def clear_account_cooldown(acc_id: int,
+                           _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """清除账号级冷却（cool_until / 熔断 / 降权），让该号立刻重新参与调度。
+
+    只清**本地调度状态**，不动官方额度、不动模型级冷却（那是另一条台账）。
+    连败/熔断计数一并清零 —— 否则残留计数会在下次失败时立刻再叠一层冷却。
+    登录态失效计数（session_dead_fails）保留：那是登录健康问题，不该被
+    「解除冷却」悄悄洗掉。
+    """
+    acc = db.query(Account).filter(Account.id == acc_id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    was_cooling = bool(
+        (acc.cool_until and acc.cool_until > datetime.utcnow())
+        or (acc.breaker_until and acc.breaker_until > datetime.utcnow())
+        or (acc.degrade_until and acc.degrade_until > datetime.utcnow())
+    )
+    acc.cool_until = None
+    acc.cool_kind = ""
+    acc.breaker_until = None
+    acc.degrade_until = None
+    acc.err_count = 0
+    acc.breaker_fails = 0
+    acc.consecutive_fails = 0
+    db.commit()
+    return {"ok": True, "cleared": was_cooling}
+
+
 @router.post("")
 def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
     body.auth_json = _decode_or_400(body.auth_json)
