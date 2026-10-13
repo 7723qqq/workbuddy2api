@@ -165,6 +165,19 @@ def _startup():
     except Exception:
         logger.exception("手机号登录会话回收线程启动失败（不影响其它功能）")
 
+    # 预热 Turing Shield 设备指纹 token（X-Device-Token）。
+    # 不预热的话，第一个请求会拿到 None（后台线程还没算完），
+    # 被上游判为「非官方客户端」→ 11128，还会触发负缓存，后续 5 分钟全部失败。
+    try:
+        from admin.turing_token import get_device_token
+        tok = get_device_token(force=True)
+        if tok:
+            logger.info("Turing 设备指纹预热成功（X-Device-Token 就绪）")
+        else:
+            logger.warning("Turing 设备指纹预热失败，X-Device-Token 为空")
+    except Exception:
+        logger.warning("Turing 设备指纹预热异常（不影响其它功能）")
+
     # 未配置登录凭据时给出醒目告警：此时后台登录一律 503，不会退化成空口令
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
         logger.warning(

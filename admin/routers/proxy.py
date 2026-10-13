@@ -215,6 +215,15 @@ def _upstream_extra_headers(request: Request, purpose: str = "conversation",
         h["X-Machine-ID"] = backend.stable_device_id(uid, "machine")
         h["X-Session-ID"] = backend.stable_device_id(uid, "session")
 
+    # Turing Shield 设备风控指纹（缺失会被上游判为非官方客户端 → 11128）
+    try:
+        from admin.turing_token import get_device_token
+        tok = get_device_token()
+        if tok:
+            h["X-Device-Token"] = tok
+    except Exception:
+        pass
+
     # 会话头族：换号重试时由调用方**复用同一份**（见 _session_headers）
     if body is not None:
         h.update(_session_headers(body, uid))
@@ -2759,8 +2768,16 @@ async def responses_proxy(
                         extra_i["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
                     headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra_i)
                     try:
+                        _dt = headers_i.get("X-Device-Token", "")
+                        _ua = headers_i.get("User-Agent", "")[:80]
+                        _logger.info("[forward] POST %s | acc=%s | X-Device-Token=%s | UA=%s | body_len=%d",
+                                     url, acc_i.uid[:12] if acc_i.uid else "?",
+                                     ("OK(" + str(len(_dt)) + "ch)") if _dt else "MISSING",
+                                     _ua, len(json.dumps(body, ensure_ascii=False)))
                         async with upstream_http.client(request, _stream_timeout(), backend.HTTP_LIMITS) as client:
                             r = await client.post(url, headers=headers_i, json=body)
+                            if r.status_code >= 400 or (r.status_code == 200 and _looks_like_inband_error(r.text)):
+                                _logger.warning("[forward] upstream %s | body=%s", r.status_code, r.text[:400])
                             if r.status_code >= 400:
                                 text = r.text[:65536]
                                 kind = _classify_error(r.status_code, text)
@@ -2946,6 +2963,7 @@ async def responses_proxy(
                                         continue
                                     raw_lines.append(line)
                                     if not delivered and (_looks_like_inband_error(line) or _sse_has_error_event(line)):
+                                        _logger.warning("[forward] in-band error | line=%s", line[:400])
                                         break
                                     events = converter.feed_line(line)
                                     if events:
@@ -3216,8 +3234,16 @@ async def anthropic_messages(
                         extra_i["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
                     headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra_i)
                     try:
+                        _dt = headers_i.get("X-Device-Token", "")
+                        _ua = headers_i.get("User-Agent", "")[:80]
+                        _logger.info("[forward] POST %s | acc=%s | X-Device-Token=%s | UA=%s | body_len=%d",
+                                     url, acc_i.uid[:12] if acc_i.uid else "?",
+                                     ("OK(" + str(len(_dt)) + "ch)") if _dt else "MISSING",
+                                     _ua, len(json.dumps(body, ensure_ascii=False)))
                         async with upstream_http.client(request, _stream_timeout(), backend.HTTP_LIMITS) as client:
                             r = await client.post(url, headers=headers_i, json=body)
+                            if r.status_code >= 400 or (r.status_code == 200 and _looks_like_inband_error(r.text)):
+                                _logger.warning("[forward] upstream %s | body=%s", r.status_code, r.text[:400])
                             if r.status_code >= 400:
                                 text = r.text[:65536]
                                 kind = _classify_error(r.status_code, text)
@@ -3371,6 +3397,17 @@ async def anthropic_messages(
                             extra_i["X-Machine-ID"] = backend.stable_device_id(acc_i.uid, "machine")
                             extra_i["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
                         headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra_i)
+                        _dt = headers_i.get("X-Device-Token", "")
+                        _ua = headers_i.get("User-Agent", "")[:80]
+                        _logger.warning("[forward-cc-stream] POST %s | acc=%s | X-Device-Token=%s | UA=%s | body_len=%d | keys=%s",
+                                     url, acc_i.uid[:12] if acc_i.uid else "?",
+                                     ("OK(" + str(len(_dt)) + "ch)") if _dt else "MISSING",
+                                     _ua, len(json.dumps(body, ensure_ascii=False)),
+                                     list(headers_i.keys()))
+                        _body_str = json.dumps(body, ensure_ascii=False)
+                        _logger.warning("[forward-cc-stream] body_head=%s | model=%s | tools_count=%d | system_type=%s",
+                                        _body_str[:500], body.get("model", "?"),
+                                        len(body.get("tools", [])), type(body.get("system")).__name__)
                         raw_lines.clear()
                         delivered = False
                         pending_events = []
@@ -3380,6 +3417,7 @@ async def anthropic_messages(
                                 if r.status_code >= 400:
                                     detail = await r.aread()
                                     text = detail[:65536].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:65536]
+                                    _logger.warning("[forward-cc-stream] upstream %s | body=%s", r.status_code, text[:400])
                                     kind = _classify_error(r.status_code, text)
                                     await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                           model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
@@ -3407,6 +3445,7 @@ async def anthropic_messages(
                                         continue
                                     raw_lines.append(line)
                                     if not delivered and (_looks_like_inband_error(line) or _sse_has_error_event(line)):
+                                        _logger.warning("[forward] in-band error | line=%s", line[:400])
                                         break
                                     events = conv.feed_line(line)
                                     if events:
