@@ -1,4 +1,4 @@
-/* Release text is always inserted as textContent, never interpreted as HTML. */
+/* Release Markdown is rendered locally and sanitized before insertion. */
 window.WBDesktop = (() => {
   let native = false, initialized = false, checking = false, releases = null, dialog, poll;
   const versionButton = () => document.getElementById('appVersion');
@@ -91,8 +91,11 @@ window.WBDesktop = (() => {
     history.append(element('h3', '历史版本'));
     for (const row of releases?.releases || []) {
       const item = element('section', undefined, 'wb-update-release');
+      const notes = element('div', undefined, 'wb-release-markdown');
+      if (window.WBReleaseNotes) WBReleaseNotes.render(notes, row.body);
+      else notes.textContent = row.body;
       item.append(element('h3', row.name), element('p', `${row.tag} · ${row.date ? new Date(row.date).toLocaleString() : ''}`, 'wb-update-meta'),
-        element('pre', row.body), link('查看此版本', row.url));
+        notes, link('查看此版本', row.url));
       history.append(item);
     }
     if (!releases?.releases?.length) history.append(element('p', '暂无已发布版本。', 'wb-update-meta'));

@@ -20,6 +20,43 @@ spec.loader.exec_module(builder)
 
 
 class AndroidBundleTests(unittest.TestCase):
+    def test_runtime_recovers_stale_origin_after_unexpected_server_exit(self):
+        builder.prepare()
+        with tempfile.TemporaryDirectory() as work:
+            script = r'''
+import json, socket, sys
+from pathlib import Path
+import android_runtime
+base = Path(sys.argv[1]) / 'WorkBuddy2API'
+base.mkdir()
+with socket.socket() as free:
+    free.bind(('127.0.0.1', 0))
+    port = free.getsockname()[1]
+# An old/incomplete install lacks password and JWT metadata.
+(base / 'config.json').write_text(json.dumps({'port':port}))
+try:
+    first = json.loads(android_runtime.start(sys.argv[1]))
+    assert android_runtime.healthy()
+    assert (base / 'workbuddy.db').is_file()
+    android_runtime._server.should_exit = True
+    android_runtime._thread.join(10)
+    assert not android_runtime.healthy()
+    # The old cached origin must not shortcut the second startup.
+    second = json.loads(android_runtime.start(sys.argv[1]))
+    assert second['origin'] == first['origin']
+    assert android_runtime.healthy()
+finally:
+    android_runtime.stop()
+'''
+            env = dict(os.environ, PYTHONUTF8='1')
+            for key in list(env):
+                if key.startswith(('ADMIN_', 'CONVERTER_', 'WORKBUDDY_', 'WB_DESKTOP_')):
+                    env.pop(key)
+            result = subprocess.run([sys.executable, '-c', script, work],
+                cwd=builder.STAGING, env=env, capture_output=True, text=True, encoding='utf-8', timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_restart_reuses_port_after_server_closes_keepalive_clients(self):
         builder.prepare()
         with tempfile.TemporaryDirectory() as work:
@@ -55,7 +92,7 @@ finally:
                 if key.startswith(('ADMIN_', 'CONVERTER_', 'WORKBUDDY_', 'WB_DESKTOP_')):
                     env.pop(key)
             result = subprocess.run([sys.executable, '-c', script, work, str(port)],
-                cwd=builder.STAGING, env=env, capture_output=True, text=True, timeout=90,
+                cwd=builder.STAGING, env=env, capture_output=True, text=True, encoding='utf-8', timeout=90,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -63,10 +100,13 @@ finally:
         html = builder.mobile_html((ROOT / "admin/static/index.html").read_text(encoding="utf-8"))
         for excluded in ('id="panel-client"', 'id="appSourceBlock"', 'data-tab="client"',
                          'onclick="scanLocal()"', 'async function scanLocal', 'async function injectAcc',
-                         'function loadClientProfile', 'function loadAppSource'):
+                         'function loadClientProfile', 'function loadAppSource', 'id="syncUrl"',
+                         'async function pushToOnline', '同步设置</button>'):
             self.assertNotIn(excluded, html)
         self.assertIn('href="/join"', html)
         self.assertIn('watchJoinAuthorization()', html)
+        self.assertIn('id="mobileCheckResults"', html)
+        self.assertIn('src="/static/mobile_settings.js"', html)
         if shutil.which("node"):
             import re
             scripts = re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>', html, re.S)

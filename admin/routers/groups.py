@@ -51,8 +51,6 @@ def effective_group_models(db: Session, group_id: int) -> set[str]:
     if not configs:
         return models  # 无模型规则配置：不额外过滤
     enabled = {m.model_id for m in configs if m.enabled == 1}
-    if not enabled:
-        return models  # 全部禁用视为未配置
     return models & enabled
 
 
@@ -68,8 +66,6 @@ def group_model_map(db: Session) -> dict[int, set[str]]:
     if not configs:
         return by_group
     enabled = {m.model_id for m in configs if m.enabled == 1}
-    if not enabled:
-        return by_group
     return {gid: (models & enabled) for gid, models in by_group.items()}
 
 

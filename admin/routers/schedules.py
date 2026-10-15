@@ -8,13 +8,13 @@ from sqlalchemy.orm import Session
 
 from admin.db import get_db
 from admin.models import Schedule
-from admin.scheduler import run_task, _dump_result
+from admin.scheduler import run_task, _dump_result, start_growth_plan
 from admin.security import require_admin
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
 TASK_CHOICES = ["refresh_balances", "refresh_credits", "sync_models", "daily_checkin",
-                "refresh_growth_tasks", "run_growth_tasks", "keepalive_tokens"]
+                "refresh_growth_tasks", "run_growth_tasks", "run_growth_plan", "keepalive_tokens"]
 TASK_LABELS = {
     "refresh_balances": "刷新平台总积分",
     "refresh_credits": "更新积分到期快照",
@@ -22,6 +22,7 @@ TASK_LABELS = {
     "daily_checkin": "每日签到领取积分",
     "refresh_growth_tasks": "每日更新成长任务列表",
     "run_growth_tasks": "每日自动做成长任务",
+    "run_growth_plan": "WorkBuddy 成长计划巡检",
     "keepalive_tokens": "token 保活（按整点）",
 }
 
@@ -139,6 +140,16 @@ def run_now(sid: int, _: bool = Depends(require_admin), db: Session = Depends(ge
     if not s:
         raise HTTPException(status_code=404, detail="任务不存在")
     now = datetime.utcnow()
+    from admin.pool import POOL
+    if POOL.waf.active():
+        result = {"task": s.task, "ok": True, "deferred": True,
+                  "summary": "出口保护期间顺延任务，保护解除后重试"}
+        s.last_result = _dump_result(result)
+        s.next_run_at = now + timedelta(seconds=max(15, POOL.waf.remaining()))
+        db.commit()
+        return {"id": s.id, "result": result}
+    if s.task == "run_growth_plan":
+        return {"id": s.id, "result": start_growth_plan(s, db)}
     try:
         _run = run_task(s.task, db, s)
         s.last_result = _dump_result(_run)

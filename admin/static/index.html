@@ -20,6 +20,7 @@
   -->
   <link rel="stylesheet" href="/static/vendor/tailwind/tailwind.min.css" />
   <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css" />
+  <link rel="stylesheet" href="/static/growth_center.css" />
   <style>
     /* ==========================================================================
        设计令牌（借鉴 workbuddy-switch 的设计系统）
@@ -755,6 +756,7 @@
         <button class="side-item" data-tab="models"><i class="fa-solid fa-shapes"></i> 模型配置</button>
         <button class="side-item" data-tab="groups"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 10 5-10 5L2 8Zm-9 10 9 5 9-5M3 18l9 5 9-5"/></svg> 分组管理</button>
         <button class="side-item" data-tab="schedules"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4v5h5m-5 0a9 9 0 1 1 0 7M12 7v5l3 2"/></svg> 定时任务</button>
+        <button class="side-item" data-tab="growth"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21v-9m0 5C3 18 2 10 3 4c6 0 9 3 9 8m0 5c9 1 10-7 9-13-6 0-9 3-9 8"/></svg> 成长计划</button>
         <button class="side-item" data-tab="logs"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg> 用量日志</button>
         <button class="side-item" data-tab="client"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 16 0m-13 5v-5a5 5 0 0 1 10 0v3m-7 5v-8a2 2 0 0 1 4 0v5m-1 5a12 12 0 0 0 4-4M3 16v-1"/></svg> 客户端参数</button>
         <button class="side-item" data-tab="sync"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18a5 5 0 1 1 1-10 6 6 0 0 1 11 1 4 4 0 0 1 0 8m-6 4V11m-4 4 4-4 4 4"/></svg> 同步设置</button>
@@ -1041,6 +1043,8 @@
     </section>
 
     <!-- 定时任务面板 -->
+    <section id="panel-growth" class="hidden"><div id="growthCenter" class="gc-page"></div></section>
+
     <section id="panel-schedules" class="hidden">
       <div class="flex flex-wrap justify-between items-center mb-3 gap-2">
         <h2 class="font-semibold">定时任务</h2>
@@ -1669,7 +1673,7 @@ function enterApp() {
 
 // Tabs
 // 面板清单与默认面板：默认面板不写进 URL（保持地址栏干净）。
-const TABS = ["accounts","credits","usage","keys","models","groups","schedules","logs","client","sync","settings"];
+const TABS = ["accounts","credits","usage","keys","models","groups","schedules","growth","logs","client","sync","settings"];
 const TAB_DEFAULT = "accounts";
 
 /** 从地址栏读当前应显示的面板；非法/缺失一律回落到默认面板。 */
@@ -1703,6 +1707,8 @@ function activateTab(name, opts) {
   // 「积分到期」旁边的角标数字一起读进去（实测变成 "积分到期 3"）。
   const cur = $("#sideCurrent");
   if (cur) cur.textContent = _sideTabLabel(name);
+  const topTitle = $("#topbarTitle");
+  if (topTitle) topTitle.textContent = _sideTabLabel(name);
 
   if (!opts || opts.updateUrl !== false) {
     try {
@@ -1720,7 +1726,8 @@ function activateTab(name, opts) {
   if (name === "logs") openLogsPanel();
   if (name === "client") loadClientProfile();
   if (name === "settings") loadAppSource();
-  if (name === "models") loadModelBusy();
+  if (name === "models") loadModels();
+  if (name === "growth") window.WBGrowthCenter?.enter();
   scheduleModelBusy();
 }
 
@@ -2077,15 +2084,30 @@ async function openModelLimits(accountId = null) {
     if (!container) return;
     if (!result.ok) { container.textContent = '读取失败，请稍后重试'; return; }
     const d = result.data;
-    const entries = (d.items || []).filter(e => accountId == null || e.account_id === accountId);
+    const limitPriority = {model_block:0, model_daily:1, model_rate:2, model_queue:3};
+    const entries = (d.items || []).filter(e => accountId == null || e.account_id === accountId).sort((a, b) =>
+      (limitPriority[a.kind] ?? 4) - (limitPriority[b.kind] ?? 4)
+      || String(a.model || '').localeCompare(String(b.model || ''))
+      || Number(a.account_id) - Number(b.account_id));
+    const healthItems = (healthResult.ok ? healthResult.data.items || [] : []).slice().sort((a, b) =>
+      Number(Number(a.available_accounts) > 0) - Number(Number(b.available_accounts) > 0)
+      || Number(b.limited_accounts || 0) - Number(a.limited_accounts || 0)
+      || String(a.model || '').localeCompare(String(b.model || '')));
     const kind = {model_daily:'日额度耗尽',model_rate:'短时限流',model_queue:'上游排队',model_block:'模型不可用'};
     const source = {upstream:'上游明确重置时间',queue_retry:'上游 retry_after（重试间隔，不是排队结束时间）',estimated:'本地保守估计，上游未返回重置时间',backoff:'本地退避策略，不代表上游已恢复'};
+    const risk = healthResult.ok ? healthResult.data.risk : null;
+    const observations = risk?.observations || {};
+    const riskCount = reason => Number(observations[reason]?.requests || 0);
+    const backgroundSkips = Object.values(risk?.maintenance?.skipped_since_start || {}).reduce((sum, n) => sum + Number(n), 0);
     container.innerHTML = `<p class="limit-note">积分余额与模型每日额度分别计算；0 倍率模型也可能触发日限额。冷却仅作用于对应账号的对应模型，到期后自动恢复候选资格。今日请求 / Token 仅统计本网关成功调用，无法据此推算官方剩余额度或客户端消耗。</p>
       ${d.waf_remaining_seconds > 0 ? `<p class="limit-note">出口 IP 保护已触发，约 ${d.waf_remaining_seconds} 秒后解除本地保护，是否可用仍需上游确认。</p>` : ''}
-      <h4 class="health-title">模型健康 · 近 24 小时</h4>
-      <div class="overflow-x-auto"><table class="tbl health-table"><thead><tr><th>模型</th><th>可选 / 受限账号</th><th>成功 / 请求</th><th>失败率</th><th>首响应 P50 / P95</th><th>总耗时 P95</th><th>最早冷却截止</th></tr></thead><tbody>${healthResult.ok ? (healthResult.data.items || []).map(m => `<tr><td><b>${esc(m.model)}</b>${m.free ? '<small class="health-free">免费</small>' : ''}</td><td>${m.available_accounts} / ${m.limited_accounts}</td><td>${m.successes} / ${m.requests}</td><td>${m.failure_rate == null ? '—' : (m.failure_rate * 100).toFixed(1) + '%'}</td><td>${m.ttfb_ms.p50 == null ? '—' : m.ttfb_ms.p50 + ' ms'} / ${m.ttfb_ms.p95 == null ? '—' : m.ttfb_ms.p95 + ' ms'}</td><td>${m.latency_ms.p95 == null ? '—' : m.latency_ms.p95 + ' ms'}</td><td>${m.earliest_model_recovery ? fmtTime(m.earliest_model_recovery) : '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">暂无模型观测</td></tr>' : '<tr><td colspan="7" class="account-empty">健康统计暂时不可用</td></tr>'}</tbody></table></div>
+      ${risk ? `<p class="limit-note">近 ${Number(risk.window_minutes)} 分钟网关观测：WAF ${riskCount('waf')} 次，账号限流 ${riskCount('soft_rate')} 次，模型限流 / 排队 ${riskCount('model_rate')} 次，授权限制 ${riskCount('account_fault')} 次，登录失效 ${riskCount('session_dead')} 次。后台当前预留 ${Number(risk.maintenance.reserved_accounts)} 个账号，本进程启动以来累计保护跳过 ${backgroundSkips} 次；这是本网关观测，不代表官方风控评分。</p>` : ''}
+      <h4 class="health-title">当前模型限制 · 不可用优先</h4>
+      <div class="overflow-x-auto"><table class="tbl min-w"><thead><tr><th>账号</th><th>模型</th><th>原因</th><th>重置 / 重试 / 本地冷却截止（北京时间）</th><th>依据</th><th>今日请求 / Token</th><th>操作</th></tr></thead><tbody>${entries.map(e => `<tr><td>${esc(e.account_name)}</td><td>${esc(e.model)}</td><td>${kind[e.kind] || esc(e.kind)}</td><td>${modelLimitDeadlineLabel(e)}<br>${fmtTime(e.until)}</td><td>${source[e.reset_source] || '本地退避策略'}</td><td>${e.requests_today} / ${e.tokens_today}</td><td><button class="console-btn quiet" onclick="clearModelLimit(${e.account_id},${esc(JSON.stringify(e.model))})">解除冷却</button></td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">当前没有模型冷却记录</td></tr>'}</tbody></table></div>
+      <h4 class="health-title">模型健康 · 近 24 小时（无可选账号优先）</h4>
+      <div class="overflow-x-auto"><table class="tbl health-table"><thead><tr><th>模型</th><th>可选 / 受限账号</th><th>成功 / 请求</th><th>失败率</th><th>首响应 P50 / P95</th><th>总耗时 P95</th><th>最早冷却截止</th></tr></thead><tbody>${healthResult.ok ? healthItems.map(m => `<tr><td><b>${esc(m.model)}</b>${m.free ? '<small class="health-free">免费</small>' : ''}</td><td>${m.available_accounts} / ${m.limited_accounts}</td><td>${m.successes} / ${m.requests}</td><td>${m.failure_rate == null ? '—' : (m.failure_rate * 100).toFixed(1) + '%'}</td><td>${m.ttfb_ms.p50 == null ? '—' : m.ttfb_ms.p50 + ' ms'} / ${m.ttfb_ms.p95 == null ? '—' : m.ttfb_ms.p95 + ' ms'}</td><td>${m.latency_ms.p95 == null ? '—' : m.latency_ms.p95 + ' ms'}</td><td>${m.earliest_model_recovery ? fmtTime(m.earliest_model_recovery) : '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">暂无模型观测</td></tr>' : '<tr><td colspan="7" class="account-empty">健康统计暂时不可用</td></tr>'}</tbody></table></div>
       <p class="limit-note">延迟取最近最多 2000 条成功记录；账号可选数包含当前进程在途占用和出口保护。冷却截止只表示可再次尝试，不保证上游模型或账号已恢复可用。</p>
-      <div class="overflow-x-auto"><table class="tbl min-w"><thead><tr><th>账号</th><th>模型</th><th>原因</th><th>重置 / 重试 / 本地冷却截止（北京时间）</th><th>依据</th><th>今日请求 / Token</th><th>操作</th></tr></thead><tbody>${entries.map(e => `<tr><td>${esc(e.account_name)}</td><td>${esc(e.model)}</td><td>${kind[e.kind] || esc(e.kind)}</td><td>${modelLimitDeadlineLabel(e)}<br>${fmtTime(e.until)}</td><td>${source[e.reset_source] || '本地退避策略'}</td><td>${e.requests_today} / ${e.tokens_today}</td><td><button class="console-btn quiet" onclick="clearModelLimit(${e.account_id},${esc(JSON.stringify(e.model))})">解除冷却</button></td></tr>`).join('') || '<tr><td colspan="7" class="account-empty">当前没有模型冷却记录</td></tr>'}</tbody></table></div>`;
+`;
   } catch(e) {
     const container = document.getElementById('modelLimitsContent');
     if (container) container.textContent = '读取失败，请稍后重试';
@@ -2131,6 +2153,7 @@ function accRow(a) {
         <span class="c-uid" title="${esc(a.uid || "")}">${esc(a.uid || "-")}</span>
         ${a.bound_key_id ? `<small class="text-indigo-600">Key 独占：${esc(a.bound_key_name || ("#" + a.bound_key_id))}</small>` : ''}
         ${a.post_login_automation ? `<small style="color:var(--fg-muted)" title="${esc((a.post_login_automation.result?.errors || []).join('；'))}">${esc(({queued:'自动任务排队中',running:'自动任务执行中',completed:'自动任务已完成',failed:'部分自动任务未完成'})[a.post_login_automation.status] || '')}</small>` : ''}
+          ${a.resource_initialization && a.resource_initialization.status !== 'completed' ? `<small style="color:var(--fg-muted)" title="${esc((a.resource_initialization.errors || []).join('；'))}">${esc(({queued:'余额与模型初始化排队中',running:'正在初始化余额与模型',failed:'初始化未完成，可刷新余额或同步模型',invalid_credential:'账号凭证不完整，请重新导入或授权登录'})[a.resource_initialization.status] || '')}</small>` : ''}
       </div>
     </td>
     <td class="col-status" data-label="状态">${badge(a.status)}${accountLimitBadge(a)}</td>
@@ -2144,7 +2167,9 @@ function accRow(a) {
   </tr>`;
 }
 
+let _accountResourceTimer = null;
 async function loadAccounts() {
+  clearTimeout(_accountResourceTimer);
   const r = await api("/api/accounts"); if (!r.ok) return;
   const d = await r.json();
   const s = d.summary;
@@ -2179,6 +2204,9 @@ async function loadAccounts() {
       + (s.disabled ? ` · 已禁用 ${s.disabled}` : "") + `）`;
   }
   _accData = d.items || [];
+  if (_accData.some(a => ['queued','running'].includes(a.resource_initialization?.status))) {
+    _accountResourceTimer = setTimeout(async () => { await loadAccounts(); await loadModels(); }, 2000);
+  }
   _accSummary = s;
   renderAccPage(1);
   // 侧栏角标：没打开积分面板也能看到「有额度要作废」
@@ -3687,8 +3715,9 @@ async function submitUpload(){
    ========================================================================== */
 
 /** 触发浏览器下载一个文本文件。 */
-function downloadText(filename, text) {
-  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+async function downloadText(filename, text, mime = "application/json") {
+  if(window.WBMobile?.saveText) return WBMobile.saveText(filename, text, mime);
+  const blob = new Blob([text], { type: mime + ";charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = filename;
@@ -3750,9 +3779,11 @@ async function doExport() {
   // 每行一个 JSON 对象（JSONL）：既能被批量上传逐行解析，
   // 也能用文本工具按行处理，比单个大数组更实用。
   const text = d.items.map(x => JSON.stringify(JSON.parse(x))).join("\n");
-  downloadText(`workbuddy-accounts-${exportStamp()}.info`, text);
-  closeModal();
-  toast(`已导出 ${d.count} 个账号${d.skipped ? `（跳过 ${d.skipped} 个无效凭据）` : ""}`, "ok");
+  try {
+    await downloadText(`workbuddy-accounts-${exportStamp()}.info`, text);
+    closeModal();
+    toast(`已导出 ${d.count} 个账号${d.skipped ? `（跳过 ${d.skipped} 个无效凭据）` : ""}`, "ok");
+  } catch(error) { toast(error.message || '文件未保存', 'err'); }
 }
 
 async function copyExport() {
@@ -3779,8 +3810,10 @@ async function exportAcc(id, name) {
   const d = await r.json().catch(() => ({}));
   if (!r.ok) { toast("导出失败：" + (d.detail || r.status), "err"); return; }
   const safe = String(name || d.name || d.uid || id).replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
-  downloadText(`${safe || "account"}-${id}.info`, JSON.stringify(JSON.parse(d.item), null, 2));
-  toast(`已导出账号「${name || d.name || id}」`, "ok");
+  try {
+    await downloadText(`${safe || "account"}-${id}.info`, JSON.stringify(JSON.parse(d.item), null, 2));
+    toast(`已导出账号「${name || d.name || id}」`, "ok");
+  } catch(error) { toast(error.message || '文件未保存', 'err'); }
 }
 
 function openAddAccount(){
@@ -4045,7 +4078,7 @@ const MODEL_BUSY_LABELS = {idle:'空闲', normal:'空闲', busy:'轻微拥堵', 
 let _modelBusy = {}, _modelBusyTimer = null, _modelBusyLoading = false;
 function modelBusyBadge(m) {
   const state = _modelBusy[m.model_id] || {};
-  const level = Object.hasOwn(MODEL_BUSY_LABELS, state.busy_level) ? state.busy_level : 'unknown';
+  const level = Object.prototype.hasOwnProperty.call(MODEL_BUSY_LABELS, state.busy_level) ? state.busy_level : 'unknown';
   const tip = state.observed_at ? `上游采集：${fmtTime(state.observed_at)}${state.stale ? '（刷新失败，显示上次结果）' : ''}` : '尚未获取上游繁忙程度';
   return `<span class="model-busy ${level}" title="${esc(tip)}">${MODEL_BUSY_LABELS[level]}${state.stale && state.observed_at ? ' · 缓存' : ''}</span>`;
 }
@@ -4698,15 +4731,19 @@ async function changePassword(){
 
 /* ==================== 定时任务 ==================== */
 let _schedules = [];
+let _schedulePollTimer = null;
+const _scheduleRequests = new Set();
 
 // 任务类型 -> 人话名称。结果里有 summary 就用它，这样每个任务都统一可读。
 // keepalive_tokens 是既有任务（保活）但两张表都漏了它，显得像"未知任务"。
 const TASK_LABELS = {
   daily_checkin: "每日签到领取积分",
   refresh_balances: "刷新平台总积分",
+  refresh_credits: "更新积分到期快照",
   sync_models: "同步模型列表",
   refresh_growth_tasks: "更新成长任务列表",
   run_growth_tasks: "自动做成长任务",
+  run_growth_plan: "WorkBuddy 成长计划巡检",
   keepalive_tokens: "token 保活（按整点）",
 };
 
@@ -4852,6 +4889,10 @@ function showScheduleResult(id){
 async function loadSchedules(){
   const r = await api("/api/schedules"); if(!r.ok) return; const d = await r.json();
   _schedules = d.items||[];
+  clearTimeout(_schedulePollTimer);
+  if(_schedules.some(s => { try { return JSON.parse(s.last_result||"{}").running; } catch(e) { return false; } })){
+    _schedulePollTimer = setTimeout(() => loadSchedules(), 4000);
+  }
   $("#scheduleBody").innerHTML = (_schedules).map(s => `
     <tr class="border-t hover:bg-slate-50">
       <td class="px-4 py-3 whitespace-nowrap">${esc(s.name)}</td>
@@ -4874,12 +4915,23 @@ async function loadSchedules(){
       </td>
     </tr>`).join("") || `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">还没有定时任务</td></tr>`;
 }
-async function runSchedule(id){ toast("运行中...","ok"); const r=await api("/api/schedules/"+id+"/run",{method:"POST"}); if(r.ok){ toast("运行完成"); } else { const d=await r.json().catch(()=>({})); toast("运行失败: "+(d.detail||""),"err"); } loadSchedules(); }
+async function runSchedule(id){
+  if(_scheduleRequests.has(id)) return;
+  _scheduleRequests.add(id);
+  toast("正在启动任务...","ok");
+  try {
+    const r=await api("/api/schedules/"+id+"/run",{method:"POST"});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok){ toast(d.result?.running ? "任务在后台执行，结果会自动刷新" : "运行完成"); }
+    else { toast("运行失败: "+(d.detail||""),"err"); }
+    await loadSchedules();
+  } finally { _scheduleRequests.delete(id); }
+}
 async function toggleSchedule(id){ await api("/api/schedules/"+id+"/toggle",{method:"POST"}); loadSchedules(); }
 async function delSchedule(id){ if(!await uiConfirm({message:"确认删除该任务？", title:"删除定时任务"}))return; const r=await api("/api/schedules/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"失败",r.ok?"ok":"err"); if(r.ok) loadSchedules(); }
 function scheduleForm(title, data){
   data = data || {};
-  const tasks = [["refresh_balances","刷新平台总积分"],["sync_models","同步模型列表"],["daily_checkin","每日签到领取积分"]];
+  const tasks = Object.entries(TASK_LABELS);
   const taskOpts = tasks.map(t => ({ value: String(t[0]), label: t[1] }));
   const saVal = (data.stop_after||"").slice(0,16); // 适配 <input type="datetime-local">
   const isCheckin = data.task==="daily_checkin";
@@ -4891,6 +4943,7 @@ function scheduleForm(title, data){
         options: taskOpts, onChange: () => onTaskChange() })}</div>
     <label class="block text-sm mb-1">间隔（分钟）</label>
     <input id="scIv" type="number" min="1" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" value="${data.interval_minutes||60}" />
+    <p class="text-xs text-slate-500 mb-3">成长计划建议每 60 分钟巡检：逐账号补每日活跃、签到、领取旅行礼物、兑换连登奖励并使用免费抽奖次数。每天最多一次成功活跃对话；每日最多开启一批盲盒（5个以内，消耗已有能量）、抽奖5次。进度持久化，重复运行会跳过已完成项。</p>
     <div id="scStopWrap" class="${isCheckin?'':'hidden'}">
       <label class="block text-sm mb-1">停止领取时间（可选）</label>
       <input id="scStop" type="datetime-local" class="w-full border rounded-lg px-3 py-2 mb-1 text-sm" value="${saVal}" />
@@ -5209,11 +5262,7 @@ async function exportLogs(){
   try {
     const r = await api("/api/logs/export" + qs, { method: "GET" });
     if(!r.ok){ toast("导出失败", "err"); return; }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = "usage_logs.csv"; a.click();
-    URL.revokeObjectURL(url);
+    await downloadText('usage_logs.csv', await r.text(), 'text/csv');
     toast("已导出 usage_logs.csv");
   } catch(e){ toast("导出异常: " + e.message, "err"); }
 }
@@ -5739,6 +5788,10 @@ if (TOKEN && !new URLSearchParams(location.search).has("desktop")) {
   });
 } else { /* 显示登录 */ }
 </script>
+<script src="/static/growth_center.js"></script>
+<script src="/static/vendor/marked-12.0.2.min.js"></script>
+<script src="/static/vendor/dompurify-3.4.17.min.js"></script>
+<script src="/static/release-notes.js"></script>
 <script src="/static/desktop.js"></script>
 </body>
 </html>

@@ -15,9 +15,8 @@ from datetime import datetime, timedelta
 from admin.db import SessionLocal
 from admin.models import Schedule
 from admin.config import settings
-
-#: 账号间保活节流间隔（秒），从配置读取，缺省 0.8。
-_KEEPALIVE_ACCOUNT_GAP = settings.KEEPALIVE_ACCOUNT_GAP
+from admin import maintenance
+from collections import Counter
 
 #: last_result 是 TEXT，存得下完整 JSON；但仍给一个上限，
 #: 防止某个任务的明细异常膨胀把这一行撑爆。
@@ -79,26 +78,38 @@ def _dump_result(result: dict) -> str:
 
 def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
     """执行某个任务，返回结果摘要字典。"""
+    from admin.pool import POOL
+    if POOL.waf.active():
+        return {"task": task, "ok": True, "deferred": True,
+                "retry_after": max(1, POOL.waf.remaining()),
+                "summary": "出口保护期间暂停后台上游任务"}
     if task == "refresh_balances":
         from admin.routers import accounts as acc_router
         from admin.models import Account
         ok = fail = 0
+        skipped = Counter()
         failed_names: list[str] = []
         for a in db.query(Account).filter(Account.status == "active").all():
-            # with_expiry=True：顺带同步「积分包到期快照」。
-            # 这个快照是选号策略（expiring / weighted）的依据 —— 之前
-            # credits_expiring 长期是 0，导致「先用快过期的额度」这条规则
-            # 实际上从未生效。
-            if acc_router._refresh_balance(a, with_expiry=True):
-                ok += 1
-            else:
-                fail += 1
-                failed_names.append(_account_label(a))
-            db.commit()
+            with maintenance.account_slot(a, db) as reason:
+                if reason:
+                    skipped[reason] += 1
+                    continue
+                # with_expiry=True：顺带同步「积分包到期快照」。
+                # 这个快照是选号策略（expiring / weighted）的依据 —— 之前
+                # credits_expiring 长期是 0，导致「先用快过期的额度」这条规则
+                # 实际上从未生效。
+                if acc_router._refresh_balance(a, with_expiry=True,
+                                               on_error=lambda error: maintenance.note_failure(db, a, error)):
+                    ok += 1
+                else:
+                    fail += 1
+                    failed_names.append(_account_label(a))
+                db.commit()
         rows = db.query(Account).filter(Account.status == "active").all()
         expiring = sum(int(a.credits_expiring or 0) for a in rows)
         expiring_soon = sum(int(a.credits_expiring_soon or 0) for a in rows)
         return {"task": task, "ok": True, "refreshed": ok, "failed": fail,
+                "skipped": sum(skipped.values()), "skip_reasons": dict(skipped),
                 "credits_expiring": expiring,
                 "credits_expiring_soon": expiring_soon,
                 "failed_accounts": failed_names[:10],
@@ -106,11 +117,13 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
                             + (f"，7 天内到期积分 {expiring_soon}" if expiring_soon
                                else (f"，快过期积分 {expiring}" if expiring else ""))
                             + (f"，{fail} 个失败：{'、'.join(failed_names[:3])}"
-                               if fail else ""))}
+                               if fail else "")
+                            + (f"，{sum(skipped.values())} 个因保护或占用跳过" if skipped else ""))}
     if task == "refresh_credits":
         from admin.routers import accounts as acc_router
         from admin.models import Account
         ok = fail = 0
+        skipped = Counter()
         failed_names: list[str] = []
         # 逐号重采积分包明细 → 写回到期快照。选号的「先用快过期的」这条
         # 规则完全建立在这份快照上，所以它必须按自己的节奏刷新，
@@ -118,30 +131,35 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         # 一旦为了省钱把 with_expiry 关掉，调度依据就悄悄归零了
         # （这个 bug 真实发生过）。
         for a in db.query(Account).filter(Account.status == "active").all():
-            try:
-                sess = None
+            with maintenance.account_slot(a, db) as reason:
+                if reason:
+                    skipped[reason] += 1
+                    continue
                 try:
-                    from admin.backend import AccountSession
-                    sess = AccountSession(a.auth_json)
-                    packages = sess.fetch_credit_details()
-                    a.auth_json = sess.updated_json()
-                finally:
-                    if sess is not None:
-                        try:
-                            sess.close()
-                        except Exception:
-                            pass
-                acc_router._sync_credit_snapshot(a, packages)
-                collection = getattr(packages, "metadata", None)
-                if collection and not collection["complete"]:
+                    sess = None
+                    try:
+                        from admin.backend import AccountSession
+                        sess = AccountSession(a.auth_json)
+                        packages = sess.fetch_credit_details()
+                        a.auth_json = sess.updated_json()
+                    finally:
+                        if sess is not None:
+                            try:
+                                sess.close()
+                            except Exception:
+                                pass
+                    acc_router._sync_credit_snapshot(a, packages)
+                    collection = getattr(packages, "metadata", None)
+                    if collection and not collection["complete"]:
+                        fail += 1
+                        failed_names.append(_account_label(a))
+                    else:
+                        ok += 1
+                except Exception as error:
+                    maintenance.note_failure(db, a, error)
                     fail += 1
                     failed_names.append(_account_label(a))
-                else:
-                    ok += 1
-            except Exception:
-                fail += 1
-                failed_names.append(_account_label(a))
-            db.commit()
+                db.commit()
         rows = db.query(Account).filter(Account.status == "active").all()
         expiring_soon = sum(int(a.credits_expiring_soon or 0) for a in rows)
         soonest = min((a.credits_soonest_expire_at for a in rows
@@ -153,13 +171,15 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
             soonest_txt = (f"，最近一个 {int(left)} 天后到期" if left >= 1
                            else "，最近一个 24 小时内到期")
         return {"task": task, "ok": True, "refreshed": ok, "failed": fail,
+                "skipped": sum(skipped.values()), "skip_reasons": dict(skipped),
                 "credits_expiring_soon": expiring_soon,
                 "failed_accounts": failed_names[:10],
                 "summary": (f"已更新 {ok} 个账号的积分到期快照"
                             + (f"，7 天内到期 {expiring_soon} 积分" if expiring_soon else "")
                             + soonest_txt
                             + (f"，{fail} 个失败：{'、'.join(failed_names[:3])}"
-                               if fail else ""))}
+                               if fail else "")
+                            + (f"，{sum(skipped.values())} 个因保护或占用跳过" if skipped else ""))}
     if task == "sync_models":
         from admin.routers import models as models_router
         res = models_router._do_sync_models(db)
@@ -174,6 +194,9 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         return run_refresh_growth_tasks()
     if task == "run_growth_tasks":
         return run_growth_tasks()
+    if task == "run_growth_plan":
+        from admin.growth_plan import run_growth_plan
+        return run_growth_plan(db)
     if task == "keepalive_tokens":
         return run_keepalive_tokens(db)
     return {"task": task, "error": "未知任务类型"}
@@ -247,97 +270,99 @@ def run_keepalive_tokens(db) -> dict:
     dead_ids: list[int] = []        # 本次判定为「登录态失效」的账号
     errors: list[str] = []
 
-    for idx, a in enumerate(accounts):
-        # 账号间节流：批量并发刷新 token 是明显的机器特征
-        if idx and _KEEPALIVE_ACCOUNT_GAP > 0:
-            time.sleep(_KEEPALIVE_ACCOUNT_GAP)
-        sess = None
-        try:
-            sess = AccountSession(a.auth_json)
-            before = _access_token_of(sess)
-            # **强制刷新**，而不是 `get_headers()`（后者只在本地 expiresAt 临近时才刷）。
-            #
-            # 这是本事故里最容易被忽略的一层：这些号的 expiresAt 写着 2027 年，
-            # 于是 `get_headers()` 一直认为「还早」，永远不刷新 ——
-            # 保活每天都报「成功 N/N、refreshed=0」，**实际上一个 token 都没动过**。
-            # 而上游的 offline session 会因为长期没有刷新活动而失效，
-            # 最终变成 `invalid_grant: Offline user session not found`。
-            #
-            # 官方客户端正是**按 24h 固定节奏刷新**（见 10.8.1），并不看是否临近过期。
-            # 我们的「每晚一次」只要真的去刷，节奏就与官方一致。
-            sess.cm._refresh()
-            after = _access_token_of(sess)
-            if after and after != before:
-                refreshed += 1
-            # **真探测**：本地 expiresAt 不可信（登录态被吊销时它仍可能是
-            # 几千小时之后），只有打一次上游才能确认。
-            sess.fetch_models()
-            # **回写刷新后的凭证**。原实现漏了这一步：刷新出来的新 token 只存在
-            # 临时文件里，`close()` 一删就没了，库里仍是旧 token ——
-            # 等于「刷新了但白刷」，下次请求还得从头再来（或直接失败）。
-            a.auth_json = sess.updated_json()
-            ok += 1
-            # 探测成功 → 清零失效连续计数
-            if a.session_dead_fails:
-                a.session_dead_fails = 0
-            a.last_err_at = None
-            a.last_err_msg = ""
-            db.commit()
-        except Exception as e:
-            msg = str(e)
-            from admin.routers.proxy import _classify_error, _extract_http_status
-            # 从异常文本里抠出真实状态码再分类。
-            # 传 0 会把 401 归成 transport（网络抖动），于是失效号永远不被发现
-            # ——这正是「xx 个号失效、保活却报全好」的最后一环。
-            http_status = _extract_http_status(msg)
-            kind = _classify_error(http_status, msg)
-            # 只有「上游明确说登录态无效」才计入失效：401/403（session_dead）、
-            # 账号级授权故障（account_fault）。**transport 不算** —— 那是网络抖动，
-            # 把它计入会让一次抖动累积到阈值、把健康号误禁（老实现就有这个毛病）。
-            if kind in ("session_dead", "account_fault"):
-                dead_ids.append(a.id)
-                a.session_dead_fails = (a.session_dead_fails or 0) + 1
-                a.cool_kind = "session_dead"
-                a.last_err_at = datetime.utcnow()
-                # 权威判定：登录态被上游**明确拒绝**，重试多少次都一样 → 立即禁用。
+    skipped = Counter()
+    for a in accounts:
+        with maintenance.account_slot(a, db) as reason:
+            if reason:
+                skipped[reason] += 1
+                continue
+            sess = None
+            try:
+                sess = AccountSession(a.auth_json)
+                before = _access_token_of(sess)
+                # **强制刷新**，而不是 `get_headers()`（后者只在本地 expiresAt 临近时才刷）。
                 #
-                # 两种都算权威：
-                #   * HTTP 401/403；
-                #   * 刷新接口返回的 `invalid_grant` /
-                #     `Offline user session not found` —— 这是 OAuth 标准里
-                #     「该会话已在服务端被删除」的语义，属于**终态**，
-                #     与「文案式 12153 抖动」完全不同（实测那 xx 个号正是这个）。
-                authoritative = (http_status in (401, 403)
-                                 or any(m in msg.lower() for m in _AUTH_DEAD_MARKERS))
-                threshold = 1 if authoritative else _KEEPALIVE_DEAD_THRESHOLD
-                if authoritative:
-                    a.last_err_msg = (
-                        f"登录态被上游拒绝（HTTP {http_status}），需重新登录：{msg[:150]}"
-                    )[:255]
-                else:
-                    a.last_err_msg = (msg or "keepalive 探测失败")[:255]
-                if a.session_dead_fails >= threshold:
-                    a.status = "disabled"
-                    a.cool_until = None
-                    a.breaker_until = None
-                    a.degrade_until = None
-                    dead_disabled += 1
+                # 这是本事故里最容易被忽略的一层：这些号的 expiresAt 写着 2027 年，
+                # 于是 `get_headers()` 一直认为「还早」，永远不刷新 ——
+                # 保活每天都报「成功 N/N、refreshed=0」，**实际上一个 token 都没动过**。
+                # 而上游的 offline session 会因为长期没有刷新活动而失效，
+                # 最终变成 `invalid_grant: Offline user session not found`。
+                #
+                # 官方客户端正是**按 24h 固定节奏刷新**（见 10.8.1），并不看是否临近过期。
+                # 我们的「每晚一次」只要真的去刷，节奏就与官方一致。
+                sess.cm._refresh()
+                after = _access_token_of(sess)
+                if after and after != before:
+                    refreshed += 1
+                # **真探测**：本地 expiresAt 不可信（登录态被吊销时它仍可能是
+                # 几千小时之后），只有打一次上游才能确认。
+                sess.fetch_models()
+                # **回写刷新后的凭证**。原实现漏了这一步：刷新出来的新 token 只存在
+                # 临时文件里，`close()` 一删就没了，库里仍是旧 token ——
+                # 等于「刷新了但白刷」，下次请求还得从头再来（或直接失败）。
+                a.auth_json = sess.updated_json()
+                ok += 1
+                # 探测成功 → 清零失效连续计数
+                if a.session_dead_fails:
+                    a.session_dead_fails = 0
+                a.last_err_at = None
+                a.last_err_msg = ""
                 db.commit()
-                failed += 1
-                if len(errors) < 5:
-                    errors.append(f"#{a.id}: 登录态失效（{kind}"
-                                  f"{'，HTTP ' + str(http_status) if authoritative else ''}）")
-            else:
-                # 网络/未知失败：只记不罚，绝不动计数与状态
-                failed += 1
-                if len(errors) < 5:
-                    errors.append(f"#{a.id}: {kind} {msg[:90]}")
-        finally:
-            if sess is not None:
-                try:
-                    sess.close()
-                except Exception:
-                    pass
+            except Exception as e:
+                msg = str(e)
+                from admin.routers.proxy import _extract_http_status
+                # 从异常文本里抠出真实状态码再分类。
+                # 传 0 会把 401 归成 transport（网络抖动），于是失效号永远不被发现
+                # ——这正是「xx 个号失效、保活却报全好」的最后一环。
+                http_status = _extract_http_status(msg)
+                kind = maintenance.note_failure(db, a, e)
+                # Only explicit session failures count toward disabling. Account
+                # restrictions and WAF use the same cooling policy as conversations.
+                if kind == "session_dead":
+                    dead_ids.append(a.id)
+                    a.session_dead_fails = (a.session_dead_fails or 0) + 1
+                    a.cool_kind = "session_dead"
+                    a.last_err_at = datetime.utcnow()
+                    # 权威判定：登录态被上游**明确拒绝**，重试多少次都一样 → 立即禁用。
+                    #
+                    # 两种都算权威：
+                    #   * HTTP 401/403；
+                    #   * 刷新接口返回的 `invalid_grant` /
+                    #     `Offline user session not found` —— 这是 OAuth 标准里
+                    #     「该会话已在服务端被删除」的语义，属于**终态**，
+                    #     与「文案式 12153 抖动」完全不同（实测那 xx 个号正是这个）。
+                    authoritative = (http_status in (401, 403)
+                                     or any(m in msg.lower() for m in _AUTH_DEAD_MARKERS))
+                    threshold = 1 if authoritative else _KEEPALIVE_DEAD_THRESHOLD
+                    if authoritative:
+                        a.last_err_msg = (
+                            f"登录态被上游拒绝（HTTP {http_status}），需重新登录：{msg[:150]}"
+                        )[:255]
+                    else:
+                        a.last_err_msg = (msg or "keepalive 探测失败")[:255]
+                    if a.session_dead_fails >= threshold:
+                        a.status = "disabled"
+                        a.cool_until = None
+                        a.breaker_until = None
+                        a.degrade_until = None
+                        dead_disabled += 1
+                    db.commit()
+                    failed += 1
+                    if len(errors) < 5:
+                        errors.append(f"#{a.id}: 登录态失效（{kind}"
+                                      f"{'，HTTP ' + str(http_status) if authoritative else ''}）")
+                else:
+                    # Transport failures do not disable credentials; WAF/rate
+                    # restrictions have already been recorded by note_failure.
+                    failed += 1
+                    if len(errors) < 5:
+                        errors.append(f"#{a.id}: {kind} {msg[:90]}")
+            finally:
+                if sess is not None:
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
 
     # 只有「真失效」才值得告警；纯网络失败不该给人「号废了」的错觉
     summary = f"保活成功 {ok}/{total}"
@@ -349,9 +374,12 @@ def run_keepalive_tokens(db) -> dict:
                     f"{' 等' if len(dead_ids) > 5 else ''}，"
                     f"{dead_disabled} 个已自动禁用，其余待人工重登）")
     if failed and not dead_ids:
-        summary += f"，{failed} 个网络失败（不改状态）"
+        summary += f"，{failed} 个探测失败"
+    if skipped:
+        summary += f"，{sum(skipped.values())} 个因保护或在途占用跳过"
     return {"task": "keepalive_tokens", "ok": True, "total": total,
             "alive": ok, "refreshed": refreshed, "failed": failed,
+            "skipped": sum(skipped.values()), "skip_reasons": dict(skipped),
             "disabled": dead_disabled, "dead_ids": dead_ids, "errors": errors,
             "summary": summary}
 
@@ -633,6 +661,16 @@ def _checkin_summary(r: dict) -> str:
 
 
 def _run_one(s: Schedule, db, now: datetime):
+    from admin.pool import POOL
+    if POOL.waf.active():
+        s.next_run_at = now + timedelta(seconds=max(15, POOL.waf.remaining()))
+        s.last_result = _dump_result({"task": s.task, "ok": True, "deferred": True,
+                                     "summary": "出口保护期间顺延任务，保护解除后重试"})
+        db.commit()
+        return
+    if s.task == "run_growth_plan":
+        start_growth_plan(s, db)
+        return
     # 保活是「每天在指定本地整点执行」而非「每 N 分钟执行」。
     #
     # 原实现（有 bug，已修）：`if not _is_keepalive_hour(now): 顺延到下一天; return`
@@ -675,7 +713,11 @@ def _loop():
         try:
             db = SessionLocal()
             now = datetime.utcnow()
-            for s in db.query(Schedule).filter(Schedule.enabled == 1).all():
+            schedules = db.query(Schedule).filter(Schedule.enabled == 1).all()
+            # 先启动独立的成长巡检线程，再执行原有同步任务。旧的一次性
+            # 成长任务可能很长，不能让它拖延已经到期的每日活跃巡检。
+            schedules.sort(key=lambda s: s.task != "run_growth_plan")
+            for s in schedules:
                 if s.next_run_at is None or s.next_run_at <= now:
                     _run_one(s, db, now)
         except Exception:
@@ -732,6 +774,78 @@ def ensure_credit_schedule(db):
                         interval_minutes=120, enabled=1,
                         next_run_at=now + timedelta(minutes=3)))
         db.commit()
+
+
+def ensure_growth_plan_schedule(db):
+    """逐账号成长巡检：每小时检查到站礼物，每天只补一次成功对话。"""
+    if db.query(Schedule).filter(Schedule.task == "run_growth_plan").first() is None:
+        db.add(Schedule(name="WorkBuddy 成长计划巡检", task="run_growth_plan",
+                        interval_minutes=60, enabled=1,
+                        next_run_at=datetime.utcnow() + timedelta(minutes=5)))
+        db.commit()
+
+
+def start_growth_plan(schedule, db):
+    """独立后台线程执行，立即运行按钮和调度循环均无需等待整批账号。"""
+    from admin.growth_plan import _Lease, run_growth_plan
+    lease = _Lease(db)
+    if not lease.acquire():
+        # 不覆盖正在执行的进度；略延后其它同类型任务，避免每15秒重复调度。
+        if schedule.next_run_at is None or schedule.next_run_at <= datetime.utcnow():
+            schedule.next_run_at = datetime.utcnow() + timedelta(minutes=1)
+            db.commit()
+        return {"ok": True, "running": True, "summary": "成长计划正在执行"}
+    try:
+        sid = schedule.id
+        lease_value = lease.value
+        started = datetime.utcnow()
+        initial = {"task": "run_growth_plan", "ok": True, "running": True,
+                   "summary": "成长计划已开始，正在逐账号检查"}
+        schedule.last_result = _dump_result(initial)
+        schedule.last_run_at = started
+        # 进程意外退出后租约十分钟过期，调度器可自动恢复。
+        schedule.next_run_at = started + timedelta(minutes=10)
+        db.commit()
+    except Exception:
+        db.rollback()
+        lease.release()
+        raise
+
+    def worker():
+        with SessionLocal() as worker_db:
+            worker_lease = _Lease(worker_db)
+            worker_lease.value = lease_value
+
+            def progress(result):
+                row = worker_db.get(Schedule, sid)
+                if row:
+                    row.last_result = _dump_result(result)
+                    worker_db.commit()
+
+            try:
+                result = run_growth_plan(worker_db, progress=progress, lease=worker_lease)
+            except Exception as exc:
+                worker_db.rollback()
+                worker_lease.release()
+                result = {"ok": False, "error": f"成长巡检失败（{type(exc).__name__}）"}
+            row = worker_db.get(Schedule, sid)
+            if row:
+                # 刷新以保留执行期间用户修改的间隔/启停配置。
+                worker_db.refresh(row)
+                row.last_result = _dump_result(result)
+                row.next_run_at = datetime.utcnow() + timedelta(
+                    minutes=1 if result.get("pending") else row.interval_minutes or 60)
+                worker_db.commit()
+
+    thread = threading.Thread(target=worker, daemon=True, name="wb-growth-plan")
+    try:
+        thread.start()
+    except Exception:
+        lease.release()
+        schedule.last_result = _dump_result({"ok": False, "error": "成长巡检线程启动失败"})
+        db.commit()
+        raise
+    return initial
 
 
 def ensure_daily_checkin(db):
@@ -945,6 +1059,9 @@ def start_scheduler():
         ensure_growth_schedules(db)
         ensure_keepalive_schedule(db)
         ensure_credit_schedule(db)
+        ensure_growth_plan_schedule(db)
+        from admin.growth_center import import_last_run
+        import_last_run(db)
         db.close()
     except Exception:
         pass

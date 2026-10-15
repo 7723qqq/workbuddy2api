@@ -240,6 +240,10 @@ def _get_turing_device_token() -> str | None:
         return None
 
 
+class CredentialError(RuntimeError):
+    """Invalid local credentials; fixed messages contain no token values."""
+
+
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
 
@@ -249,12 +253,41 @@ class CredentialManager:
         self._cached: dict | None = None
         self._mtime: float = 0.0
 
+    @classmethod
+    def from_json(cls, raw: str):
+        """Database-backed sessions need no intermediate credential file."""
+        manager = cls(None)
+        try:
+            manager._cached = json.loads(raw)
+        except (TypeError, ValueError):
+            raise CredentialError('账号凭证不是有效 JSON，请重新导入或授权登录') from None
+        manager._validate_auth(manager._cached)
+        return manager
+
+    @staticmethod
+    def _validate_auth(session: dict) -> dict:
+        auth = session.get('auth') if isinstance(session, dict) else None
+        if not isinstance(auth, dict):
+            raise CredentialError('账号凭证缺少 auth，请重新导入或授权登录')
+        for field in ('accessToken', 'refreshToken'):
+            value = auth.get(field)
+            if (not isinstance(value, str) or not value or not value.isascii()
+                    or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)):
+                raise CredentialError(f'账号凭证 {field} 缺失或格式无效，请重新导入或授权登录')
+        return auth
+
+    def export_json(self) -> str:
+        with self._lock:
+            return json.dumps(self._session(), ensure_ascii=False)
+
     def _read_raw(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def _load_if_stale(self):
         """若文件 mtime 变了（外部刷新过），重新加载缓存。"""
+        if self.path is None:
+            return
         try:
             mt = self.path.stat().st_mtime
         except OSError:
@@ -271,7 +304,7 @@ class CredentialManager:
 
     def _is_expired(self) -> bool:
         s = self._session()
-        auth = s.get("auth") or {}
+        auth = self._validate_auth(s)
         try:
             expires_at = float(auth.get("expiresAt") or 0)
         except (TypeError, ValueError):
@@ -295,7 +328,7 @@ class CredentialManager:
     def _refresh(self):
         """调后端刷新 token，写回 auth 文件与缓存。"""
         s = self._session()
-        auth = s.get("auth") or {}
+        auth = self._validate_auth(s)
         headers = self._build_headers_from(auth, s.get("account") or {})
         headers["X-Refresh-Token"] = auth.get("refreshToken", "")
         headers["X-Auth-Refresh-Source"] = "plugin"
@@ -308,7 +341,18 @@ class CredentialManager:
             raise RuntimeError(f"刷新 token 网络失败：{e}")
         if data.get("code") != 0 or not data.get("data"):
             raise RuntimeError(f"刷新 token 失败：{data.get('msg', data)}")
-        new_auth = data["data"]
+        payload = data["data"]
+        if not isinstance(payload, dict):
+            raise CredentialError('刷新令牌返回了无效凭证，已保留原凭证，请稍后重试或授权登录')
+        new_auth = dict(payload)
+        # Upstream may retain the refresh token instead of rotating it. Never
+        # replace a usable stored credential with a partial successful payload.
+        if 'refreshToken' not in new_auth:
+            new_auth['refreshToken'] = auth['refreshToken']
+        try:
+            self._validate_auth({'auth': new_auth})
+        except CredentialError:
+            raise CredentialError('刷新令牌返回了不完整凭证，已保留原凭证，请稍后重试或授权登录') from None
         # 继承部分字段
         new_auth["domain"] = new_auth.get("domain") or auth.get("domain")
         new_auth["lastRefreshTime"] = int(time.time() * 1000)
@@ -318,6 +362,9 @@ class CredentialManager:
         if not new_auth.get("refreshExpiresAt") and new_auth.get("refreshExpiresIn"):
             new_auth["refreshExpiresAt"] = int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
         s["auth"] = new_auth
+        if self.path is None:
+            self._cached = s
+            return
         # 原子写回
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -327,6 +374,7 @@ class CredentialManager:
         self._mtime = self.path.stat().st_mtime
 
     def _build_headers_from(self, auth: dict, account: dict) -> dict:
+        self._validate_auth({'auth': auth})
         domain = auth.get("domain") or DEFAULT_DOMAIN
         h = {
             "Content-Type": "application/json",

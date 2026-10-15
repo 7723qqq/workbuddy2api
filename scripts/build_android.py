@@ -20,6 +20,11 @@ def mobile_html(html: str) -> str:
     html = re.sub(r'<button\b[^>]*data-tab="client".*?</button>', '', html, flags=re.S)
     html = re.sub(r'<section id="panel-client".*?</section>', '', html, flags=re.S)
     html = re.sub(r'<section id="panel-settings".*?</section>', '', html, flags=re.S)
+    settings = (ROOT / "android/web/settings.html").read_text(encoding="utf-8")
+    html = re.sub(r'<section id="panel-sync".*?</section>', lambda _: settings, html, flags=re.S)
+    html = html.replace('</svg> 同步设置</button>', '</svg> 设置</button>')
+    html = re.sub(r'/\* ==================== 线上同步设置.*?(?=/\* ==================== 客户端参数)',
+                  'function loadSyncConfig() {}\n\n', html, flags=re.S)
     html = re.sub(r'<button\b[^>]*onclick="scanLocal\(\)".*?</button>', '', html, flags=re.S)
     html = re.sub(r'^.*\[`injectAcc\(.*\n', '', html, flags=re.M)
     html = re.sub(r'async function injectAcc\(.*?(?=/\* 猫猫旅行)', '', html, flags=re.S)
@@ -29,9 +34,10 @@ def mobile_html(html: str) -> str:
     html = re.sub(r'^.*if \(name === "(?:client|settings)"\).*\n', '', html, flags=re.M)
     html = re.sub(r'<button\b[^>]*data-tab="settings".*?</button>', '', html, flags=re.S)
     html = html.replace('登录新账号，或从本机与备份中恢复已有账号。', '手机号登录或浏览器授权，账号保存在这台手机。')
+    html = html.replace('也可选择本地 .info 文件。', '也可选择本地 .info 文件。新版 Windows 加密凭证请先在电脑账号管理页导出后再导入，或使用手机号授权登录。')
     html = html.replace('<link rel="stylesheet" href="/static/desktop.css" />',
                         '<link rel="stylesheet" href="/static/desktop.css" /><link rel="stylesheet" href="/static/mobile.css" />')
-    html = html.replace('</body>', '<script src="/static/mobile.js"></script>\n</body>')
+    html = html.replace('</body>', '<script src="/static/mobile.js"></script><script src="/static/mobile_settings.js"></script>\n</body>')
     return html
 
 
@@ -64,7 +70,7 @@ def prepare() -> None:
     shutil.copytree(ROOT / "admin/static", staging / "admin/static")
     index = staging / "admin/static/index.html"
     index.write_text(mobile_html(index.read_text(encoding="utf-8")), encoding="utf-8")
-    for name in ("mobile.js", "mobile.css"):
+    for name in ("mobile.js", "mobile.css", "mobile_settings.js"):
         shutil.copy2(ROOT / "android/web" / name, staging / "admin/static" / name)
     for name in ("android_runtime.py", "mobile_http.py"):
         shutil.copy2(ROOT / "android/python" / name, staging / name)

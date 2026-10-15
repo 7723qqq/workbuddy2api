@@ -90,11 +90,20 @@ desktop/assets/*.png
 !tests/
 tests/*
 !tests/test_desktop.py
+!tests/test_build.py
+!tests/test_release_platforms.py
+!tests/test_release_notes.cjs
 !tests/test_android.py
+!tests/test_android_settings.py
 !tests/test_mobile_latency.py
 !tests/test_android_http.py
 !tests/test_credentials.py
 !tests/test_account_automation.py
+!tests/test_account_resources.py
+!tests/__init__.py
+!tests/test_database_isolation.py
+!tests/test_growth_plan.py
+!tests/test_growth_center.py
 !tests/test_key_account_binding.py
 !tests/test_anthropic_tool_pairing.py
 !tests/test_desensitize_user_payload.py
@@ -114,3 +123,11 @@ workbuddy_admin.db-wal
 
 # Local credentials file
 登录密码.txt
+
+# Sanitized 2api hardening notes and synthetic offline regressions
+!docs/
+docs/*
+!docs/2api-increment-risk-scheduling.md
+!tests/test_risk_scheduling.py
+!tests/test_model_group_access.py
+!tests/test_model_listing.py

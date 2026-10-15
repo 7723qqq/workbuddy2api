@@ -38,7 +38,19 @@
 .wb-update-meta{color:var(--fg-muted);font-size:12px;margin:8px 0;line-height:1.8}
 .wb-update-history{max-height:45vh;overflow:auto;overscroll-behavior:contain;margin-top:18px}
 .wb-update-release{border-top:1px solid var(--border);padding:16px 0}
-.wb-update-release pre{font-family:inherit;white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.8;margin:12px 0}
+.wb-release-markdown{font-size:13px;line-height:1.8;margin:12px 0;overflow-wrap:anywhere;min-width:0}
+.wb-release-markdown :is(h1,h2,h3,h4,h5,h6){font-size:15px;font-weight:600;margin:16px 0 8px;line-height:1.5}
+.wb-release-markdown p{margin:8px 0}
+.wb-release-markdown ul{list-style:disc;padding-left:22px;margin:8px 0}
+.wb-release-markdown ol{list-style:decimal;padding-left:22px;margin:8px 0}
+.wb-release-markdown blockquote{border-left:3px solid var(--border);padding-left:12px;color:var(--fg-muted);margin:12px 0}
+.wb-release-markdown code{font-family:Consolas,monospace;background:var(--surface-2);border-radius:4px;padding:2px 4px}
+.wb-release-markdown pre{white-space:pre;overflow:auto;max-width:100%;padding:12px;background:var(--surface-2);border-radius:8px;margin:12px 0}
+.wb-release-markdown pre code{padding:0;background:none}
+.wb-release-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse;margin:12px 0}
+.wb-release-markdown :is(th,td){border:1px solid var(--border);padding:6px 10px;min-width:90px}
+.wb-release-markdown input{margin-right:6px}
+.wb-release-markdown hr{border:0;border-top:1px solid var(--border);margin:16px 0}
 .wb-update-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px}
 .wb-update-dialog a{color:var(--brand-ink);text-decoration:underline;font-size:13px}
 @media(max-width:767px){.side-foot .version-button{display:block}.wb-update-dialog{padding:18px}}

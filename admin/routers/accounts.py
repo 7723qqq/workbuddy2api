@@ -335,7 +335,7 @@ def _sync_credit_snapshot(acc: Account, packages: list[dict]) -> dict:
     return summary
 
 
-def _refresh_balance(acc: Account, with_expiry: bool = False) -> bool:
+def _refresh_balance(acc: Account, with_expiry: bool = False, on_error=None) -> bool:
     """刷新账号余额。
 
     Args:
@@ -352,12 +352,15 @@ def _refresh_balance(acc: Account, with_expiry: bool = False) -> bool:
             if with_expiry:
                 try:
                     _sync_credit_snapshot(acc, sess.fetch_credit_details())
-                except Exception:
-                    pass  # 拿不到就保留旧值（不写 0 覆盖）
+                except Exception as error:
+                    if on_error:
+                        on_error(error)
             acc.auth_json = sess.updated_json()  # 回写可能刷新的 token
         acc.last_sync_at = datetime.utcnow()
         return True
-    except Exception:
+    except Exception as error:
+        if on_error:
+            on_error(error)
         return False
 
 
@@ -432,6 +435,7 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
     limits = _active_model_limits(db, now)
     from admin.post_login import states
     automation = states(db, [a.id for a in rows])
+    resources = states(db, [a.id for a in rows], prefix='account_resources:')
     items = [
         {
             "id": a.id,
@@ -449,6 +453,7 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "created_at": a.created_at.isoformat() if a.created_at else None,
             "model_limits": limits.get(a.id, []),
             "post_login_automation": automation.get(a.id),
+            "resource_initialization": resources.get(a.id),
             **_gateway_fields(a, now),
             **_credit_fields(a),
         }
@@ -514,7 +519,7 @@ def _active_model_limits(db: Session, now: datetime) -> dict:
         from admin.model_limits import queue_retry_time
         if (row.reason or "").startswith("[estimated]"):
             source = "estimated"
-        elif daily and row.kind == "model_daily":
+        elif (daily and row.kind == "model_daily") or (row.reason or "").startswith("[upstream]"):
             source = "upstream"
         elif row.kind == "model_queue" and queue_retry_time(row.reason or "", now):
             source = "queue_retry"
@@ -698,6 +703,7 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
             old.auth_json = it.auth_json
             _apply_meta(old, it.auth_json, profile=profile, balance=balance)
             db.commit()
+            _post_login_automation(old.id, old.name or old.uid)
             skipped += 1
             continue
         acc = Account(name=it.name) if it.name else Account()

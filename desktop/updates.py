@@ -30,25 +30,36 @@ def release_url(url: str) -> str:
 
 
 class UpdateService:
-    def __init__(self, base: Path):
+    def __init__(self, base: Path, platform: str | None = None):
         self.base = base
+        self.platform = platform or ("android" if METADATA["asset"].endswith(".apk") else "windows")
+        if self.platform not in ("windows", "android"):
+            raise ValueError("Unsupported update platform")
+        suffix = "android-arm64.apk" if self.platform == "android" else "windows-x64.exe"
+        self.asset_pattern = "WorkBuddy2API-{version}-" + suffix
+        self.cache = base / f"releases-cache-{self.platform}.json"
         self.lock = threading.Lock()
         self.releases = []
         self.etag = ""
         self.error = ""
         self.checked = False
         try:
-            cached = json.loads((base / "releases-cache.json").read_text(encoding="utf-8"))
+            cached = json.loads(self.cache.read_text(encoding="utf-8"))
             self.releases = cached.get("releases", [])
             self.etag = cached.get("etag", "")
         except (OSError, ValueError):
             pass
 
     def snapshot(self) -> dict:
-        latest = next((r for r in self.releases if newer(r["tag"])), None)
-        return {"version": VERSION, "releases": self.releases, "latest": latest,
+        candidates = [r for r in self.releases if newer(r["tag"]) and self.matches_asset(r)]
+        latest = max(candidates, key=lambda r: Version(r["tag"].lstrip("vV")), default=None)
+        return {"version": VERSION, "platform": self.platform, "releases": self.releases, "latest": latest,
                 "available": latest is not None, "error": self.error,
                 "checked": self.checked, "releases_url": RELEASES_URL}
+
+    def matches_asset(self, release: dict) -> bool:
+        expected = self.asset_pattern.format(version=release["tag"].lstrip("vV"))
+        return (release.get("asset") or {}).get("name") == expected
 
     def check(self) -> dict:
         with self.lock:
@@ -67,7 +78,7 @@ class UpdateService:
                     if row.get("draft") or row.get("prerelease"):
                         continue
                     tag = str(row.get("tag_name", ""))
-                    filename = METADATA["asset"].format(version=tag.lstrip("vV"))
+                    filename = self.asset_pattern.format(version=tag.lstrip("vV"))
                     assets = {a["name"]: a for a in row.get("assets", [])}
                     asset = assets.get(filename)
                     checksum = assets.get(filename + ".sha256")
@@ -79,7 +90,7 @@ class UpdateService:
                                      "checksum": checksum,
                                      "installable": bool(asset and (checksum or digest.startswith("sha256:")))})
                 self.releases = releases
-                atomic_json(self.base / "releases-cache.json", {"etag": self.etag, "releases": releases})
+                atomic_json(self.cache, {"etag": self.etag, "releases": releases})
                 self.error = ""
             except urllib.error.HTTPError as exc:
                 if exc.code == 304:
@@ -94,7 +105,8 @@ class UpdateService:
     def stage(self, release_id: int, progress=None) -> Path:
         # A caller passes a release ID, never a URL or executable path.
         release = next((r for r in self.releases if r["id"] == int(release_id)), None)
-        if not release or not newer(release["tag"]) or not release["installable"]:
+        if (self.platform != "windows" or not release or not newer(release["tag"])
+                or not self.matches_asset(release) or not release["installable"]):
             raise ValueError("该版本没有可校验的 Windows 更新包")
         asset = release["asset"]
         expected = (asset.get("digest") or "").removeprefix("sha256:")

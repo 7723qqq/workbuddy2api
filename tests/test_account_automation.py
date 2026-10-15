@@ -11,8 +11,8 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime, timezone
 
-_work = tempfile.TemporaryDirectory(prefix='wb-automation-test-')
-os.environ['ADMIN_DATABASE_URL'] = 'sqlite:///' + (Path(_work.name) / 'test.db').as_posix()
+from tests import DATABASE_URL, assert_test_database
+os.environ['ADMIN_DATABASE_URL'] = DATABASE_URL
 os.environ['ADMIN_GATEWAY_LIMIT_BACKEND'] = 'memory'
 os.environ['ADMIN_REDIS_URL'] = ''
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -25,12 +25,14 @@ from admin.models import Account, ApiKey, UsageLog, SystemSetting
 from admin import backend, post_login
 from admin.routers import growth, credits, proxy, logs, login
 
+assert_test_database(engine)
 Base.metadata.create_all(engine)
 atexit.register(engine.dispose)
 
 
 class DatabaseTest(unittest.TestCase):
     def setUp(self):
+        assert_test_database(engine)
         with SessionLocal() as db:
             for model in (UsageLog, Account, ApiKey, SystemSetting):
                 db.query(model).delete()
@@ -186,7 +188,7 @@ class QueueTests(DatabaseTest):
         ids = [self.account('offline-' + str(i)) for i in range(3)]
         for aid, state in zip(ids, ['queued', 'running', 'completed']):
             post_login._save(aid, state)
-        with patch.object(post_login, 'enqueue') as enqueue:
+        with patch.object(post_login, 'enqueue') as enqueue, patch.object(post_login, 'enqueue_resources'):
             post_login.resume()
         self.assertEqual({call.args[0] for call in enqueue.call_args_list}, set(ids[:2]))
 
@@ -208,7 +210,7 @@ class KeepaliveStream(httpx.SyncByteStream):
 
 class BackendTests(unittest.TestCase):
     def test_pet_gate_waits_for_delayed_progress_without_refiring(self):
-        with backend.AccountSession('{}') as s, \
+        with backend.AccountSession('{"auth":{"accessToken":"offline-access","refreshToken":"offline-refresh"}}') as s, \
              patch.object(s, 'growth_tasks', side_effect=[
                  [task('first_buddy')], [task('first_buddy', 'in_progress')],
                  [task('first_buddy', 'completed')]]), \
@@ -218,14 +220,14 @@ class BackendTests(unittest.TestCase):
         fire.assert_called_once()
 
     def test_finished_pet_gate_does_not_send_another_chat(self):
-        with backend.AccountSession('{}') as s, \
+        with backend.AccountSession('{"auth":{"accessToken":"offline-access","refreshToken":"offline-refresh"}}') as s, \
              patch.object(s, 'growth_tasks', return_value=[task('first_buddy', 'claimed')]), \
              patch.object(s, 'growth_fire_event') as fire:
             self.assertTrue(s._clear_buddy_gate()[0])
         fire.assert_not_called()
 
     def session(self, handler):
-        s = backend.AccountSession('{}')
+        s = backend.AccountSession('{"auth":{"accessToken":"offline-access","refreshToken":"offline-refresh"}}')
         s._http = httpx.Client(transport=httpx.MockTransport(handler))
         return s
 

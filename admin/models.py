@@ -213,6 +213,19 @@ class ModelConfig(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class GrowthPlanRecord(Base):
+    """成长巡检/手动领奖的逐账号持久记录，不存凭证或上游原始响应。"""
+    __tablename__ = "growth_plan_records"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    source = Column(String(24), default="schedule")
+    action = Column(String(40), default="巡检")
+    ok = Column(Integer, default=1)
+    credit = Column(Integer, default=0)
+    result_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class SystemSetting(Base):
     """简单的键值配置（同步地址 / 密钥 / 其他开关）。"""
 

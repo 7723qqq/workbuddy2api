@@ -7,7 +7,7 @@ import types
 import unittest
 from contextlib import ExitStack
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -174,20 +174,27 @@ class OwnershipTests(Fixture, unittest.TestCase):
         asyncio.run(exercise())
 
     def test_models_failure_retries_only_bound_account(self):
-        self.catalog.side_effect = RuntimeError("HTTP 500 upstream")
-        result = proxy.models(db=self.db, x_api_key="public-key", authorization=None)
-        self.assertEqual(result.status_code, 502)
-        self.db.expire_all()
-        self.assertEqual(self.a.err_count, 0)
-        self.catalog.side_effect = None
-        result = proxy.models(db=self.db, x_api_key="private-key", authorization=None)
-        self.assertEqual([m["id"] for m in result["data"]], ["free"])
-        self.catalog.reset_mock()
-        self.catalog.side_effect = [[{"id":"free"}], RuntimeError("HTTP 500 upstream")]
-        result = proxy.models(db=self.db, x_api_key="private-key", authorization=None)
-        self.assertEqual(result.status_code, 502)
-        self.assertEqual(self.catalog.call_count, 2)
-        self.assertIn('1 个账号', json.loads(result.body)["error"]["message"])
+        session = MagicMock()
+        session.updated_json.return_value = '{}'
+        session.fetch_models.side_effect = RuntimeError("HTTP 500 upstream")
+        session.fetch_model_busy.return_value = {"code":0, "data":[]}
+        context = MagicMock()
+        context.__enter__.return_value = session
+        with patch.object(proxy.backend, "AccountSession", return_value=context):
+            result = proxy.models(db=self.db, x_api_key="public-key", authorization=None)
+            self.assertEqual(result.status_code, 502)
+            self.db.expire_all()
+            self.assertEqual(self.a.err_count, 0)
+            session.fetch_models.side_effect = None
+            session.fetch_models.return_value = [{"id":"free"}]
+            result = proxy.models(db=self.db, x_api_key="private-key", authorization=None)
+            self.assertEqual([m["id"] for m in result["data"]], ["free"])
+            session.fetch_models.reset_mock()
+            session.fetch_models.side_effect = RuntimeError("HTTP 500 upstream")
+            result = proxy.models(db=self.db, x_api_key="private-key", authorization=None)
+            self.assertEqual(result.status_code, 502)
+            session.fetch_models.assert_called_once()
+            self.assertIn('1 个账号', json.loads(result.body)["error"]["message"])
 
     def test_dedupe_preserves_reserved_record(self):
         older = Account(uid="duplicate", auth_json="{}", balance_remain=100)

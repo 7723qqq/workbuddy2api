@@ -1,5 +1,22 @@
 window.WBMobile = (() => {
   let initialized = false;
+  let saveCounter = 0;
+  const saves = new Map();
+  function saveText(filename, text, mime) {
+    return new Promise((resolve, reject) => {
+      if(!window.WBAndroid?.saveText) { reject(new Error('当前安装包不支持保存文件，请更新 APK')); return; }
+      const id = String(++saveCounter);
+      const timer = setTimeout(() => { saves.delete(id); reject(new Error('文件保存超时，请重试')); }, 300000);
+      saves.set(id, {resolve, reject, timer});
+      if (!WBAndroid.saveText(id, filename, text, mime)) saveResult(id, false, '无法开始保存，请等待其他导出完成');
+    });
+  }
+  function saveResult(id, ok, message) {
+    const pending = saves.get(String(id));
+    if (!pending) return;
+    saves.delete(String(id)); clearTimeout(pending.timer);
+    if(ok) pending.resolve(); else pending.reject(new Error(message || '文件未保存'));
+  }
   function initialize(token) {
     TOKEN = token;
     localStorage.setItem(TOKEN_KEY, token);
@@ -9,6 +26,7 @@ window.WBMobile = (() => {
       document.getElementById('localBoot').remove();
       document.getElementById('topbarMode').textContent = '手机本地运行';
       WBDesktop.checkUpdatesAtStartup();
+      window.WBMobileSettings?.start();
     }
     window.dispatchEvent(new Event('wb-shell-resume'));
   }
@@ -99,5 +117,5 @@ window.WBMobile = (() => {
   }
   compact.addEventListener('change', arrangeHeader);
   arrangeHeader();
-  return {initialize};
+  return {initialize, saveText, saveResult};
 })();

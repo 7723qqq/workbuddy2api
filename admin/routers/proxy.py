@@ -1183,14 +1183,17 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         else:
             base = max(1, settings.SOFT_RATE_SECONDS)
             cap = max(base, settings.SOFT_RATE_MAX_SECONDS)
-        if reset_at is not None:
-            until = min(reset_at, now + timedelta(seconds=cap))
+        if reset_at is not None and reset_at > now:
+            until = min(reset_at, now + timedelta(days=7))
         else:
             streak = (acc.err_count or 0) + 1
             until = now + timedelta(seconds=min(base * (2 ** min(streak - 1, 8)), cap))
-        # 已在软冷却中不延长（防兜底探测把冷却越堆越厚）
+        # Local backoff never extends an active cooldown. A later explicit
+        # upstream deadline can extend it, but cannot shorten it.
         if acc.cool_kind != "soft_rate" or not acc.cool_until or acc.cool_until <= now:
             acc.cool_until = until
+        elif reset_at is not None and reset_at > now:
+            acc.cool_until = max(acc.cool_until, until)
         acc.cool_kind = "soft_rate"
         acc.err_count = (acc.err_count or 0) + 1
         acc.breaker_fails = 0
@@ -1202,8 +1205,8 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         # 时长按码族分档：
         #   * 6004/6008 是日额度：官方恢复时间优先，缺失时保守冷却 24h。
         #   * 14003 是「模型繁忙 / 请求过于频繁」——瞬时，且上游自己的建议
-        #     就是「切换模型或稍后重试」。给秒级；即便上游带了 Retry-After，
-        #     也按 REQUEST_RATE_MAX_SECONDS 封顶，免得把一次抖动记成小时级。
+        #     就是「切换模型或稍后重试」。无官方时间时给秒级退避；
+        #     有明确 Retry-After/reset 时遵守上游时间，不套本地退避上限。
         if _json_code(msg) in _QUEUE_CODES:
             from admin.model_limits import queue_retry_time
             # retry_after is a queue polling delay, not an account quota reset.
@@ -1212,13 +1215,9 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
                                 reset_at=queue_retry_time(msg, now) or reset_at,
                                 fallback_seconds=max(1, settings.REQUEST_RATE_SECONDS))
         elif _json_code(msg) in _REQUEST_RATE_CODES:
-            cap = max(1, _req_rate_seconds()[1])
-            ra = reset_at
-            if ra is not None:
-                ra = min(ra, datetime.utcnow() + timedelta(seconds=cap))
             _set_model_cooldown(db, acc, model, "model_rate",
                                 (msg or "14003 model busy")[:255],
-                                reset_at=ra,
+                                reset_at=reset_at,
                                 fallback_seconds=max(1, _req_rate_seconds()[0]))
         elif _json_code(msg) in _MODEL_RATE_CODES:
             estimated = reset_at is None or reset_at <= now
@@ -1413,7 +1412,8 @@ def _set_model_cooldown(db: Session, acc: Account, model: str, kind: str,
     elif kind == "model_queue" and reset_at is not None and reset_at > now:
         until = min(reset_at, now + timedelta(days=7))
     elif kind == "model_rate" and reset_at is not None and reset_at > now:
-        until = min(reset_at, now + timedelta(seconds=settings.SOFT_RATE_MAX_SECONDS))
+        until = min(reset_at, now + timedelta(days=7))
+        reason = "[upstream] " + reason[:240]
     elif kind == "model_block":
         # 负缓存按命中次数指数退避：官方确定「该后端无此模型」，重试无意义；
         # 半开到期后允许再试一次，再命中就翻倍，封顶 24h。
@@ -1428,6 +1428,9 @@ def _set_model_cooldown(db: Session, acc: Account, model: str, kind: str,
     elif row.until and row.until > now:
         # A later transient error must not erase an existing daily cooldown.
         if row.kind == "model_daily" and kind != "model_daily":
+            row.hits = (row.hits or 0) + 1
+            return
+        if row.until >= until and (row.reason or "").startswith("[upstream]"):
             row.hits = (row.hits or 0) + 1
             return
         until = max(until, row.until)
@@ -2200,30 +2203,25 @@ def _map_anthropic_model(db: Session, model: str, key: "ApiKey | None" = None) -
 
     按顺序判定：
       1. 空 / auto                 → auto（由号池按免费优先自选）
-      2. 已在白名单里（如 glm-5.2） → 原样，允许直接点名上游模型
-      3. 含 opus / sonnet / haiku   → 取 .env 配置的对应档次模型
-      4. 其余（claude-* 等）        → auto
+      2. 具体上游模型名           → 保留原名，由统一权限检查决定是否允许
+      3. Claude 的 opus/sonnet/haiku 别名 → 取配置的对应档次模型，再检查权限
+      4. 其它 claude-* 别名        → auto
 
-    传了 key（且绑定了分组）时，判定 2 的「在白名单里」改为「在该分组里」：
-    否则客户端点一个分组外的模型名会被原样放行，绕过分组限制。
+    移出分组或禁用的具体模型不能退回 auto，否则一次应被拒绝的调用
+    会静默改用其它模型并成功。档次映射目标也遵守相同的权限检查。
     """
     allowed = _key_group_models(db, key)
     m = (model or "").strip()
     if not m or m == "auto":
         return "auto"
-    if getattr(key, "account_id", None) and not m.lower().startswith("claude-"):
-        return m  # Concrete upstream IDs must pass the account entitlement check.
-    if allowed is not None:
-        if m in allowed:
-            return m
-    elif _pick_best_model(db, m):
+    if (not m.lower().startswith("claude-")
+            or db.query(ModelConfig.id).filter(ModelConfig.model_id == m).first() is not None
+            or (allowed is not None and m in allowed)):
         return m
     low = m.lower()
     for tier, target in _ANTHROPIC_MODEL_TIERS:
         if tier in low and target:
-            # 档次映射目标也必须落在分组内，否则退化为 auto 由组内自选
-            if allowed is None or target in allowed:
-                return target
+            return target
     return "auto"
 
 
@@ -3725,35 +3723,36 @@ def models(
     tried_ids: set[int] = set()
     last_err = ""
     max_try = max(1, min(settings.MAX_ROTATE, _MODELS_MAX_TRY))
+    from admin import maintenance, model_listing
     for attempt in range(max_try):
         if acc is None:
             break
         try:
-            def fetch():
-                with backend.AccountSession(acc.auth_json) as sess:
-                    models_raw = sess.fetch_models()
-                    acc.auth_json = sess.updated_json()
-                return models_raw
             with request_metrics.measure('models_catalog'):
-                models_raw = model_catalog.get_models(acc.auth_json, settings.BACKEND, fetch)
+                with backend.AccountSession(acc.auth_json) as sess:
+                    try:
+                        # Explicit list refreshes must read current upstream prices.
+                        # Automatic routing retains its separate catalog TTL cache.
+                        models_raw = sess.fetch_models()
+                        data = [{
+                            "id": m.get("id"), "object": "model", "owned_by": "codebuddy",
+                            "name": m.get("name") or m.get("id"),
+                            "credit_multiplier": backend.CredentialManager._parse_credit_multiplier(m.get("credits"))
+                            if hasattr(backend.CredentialManager, "_parse_credit_multiplier") else None,
+                        } for m in models_raw
+                            if m.get("id") and m.get("id", "").lower() != "auto"
+                            and (m.get("id") in allowed if allowed is not None else
+                                 not configs or m.get("id") in enabled_ids)]
+                        _note_success(db, acc)
+                        data = model_listing.enrich_entries(
+                            sess, data, on_error=lambda error: maintenance.note_failure(db, acc, error))
+                    finally:
+                        acc.auth_json = sess.updated_json()
             acc.last_used_at = datetime.utcnow()
             # 注意参数顺序是 (db, acc) —— 写反了会把 Session 当账号用，
             # 报 "'Session' object has no attribute 'breaker_fails'"，而且因为
             # 在 try 里会被当成「取模型失败」→ 502，很难一眼看出是参数顺序问题。
-            _note_success(db, acc)
             db.commit()
-            data = [{
-                "id": m.get("id"),
-                "object": "model",
-                "owned_by": "codebuddy",
-                "name": m.get("name") or m.get("id"),
-                "credit_multiplier": backend.CredentialManager._parse_credit_multiplier(m.get("credits"))
-                if hasattr(backend.CredentialManager, "_parse_credit_multiplier") else None,
-            } for m in models_raw
-                if m.get("id")
-                and m.get("id", "").lower() != "auto"
-                and (m.get("id") in allowed if allowed is not None else
-                     not enabled_ids or m.get("id") in enabled_ids)]
             return {"object": "list", "data": data, "source": "backend"}
         except Exception as e:
             last_err = str(e)

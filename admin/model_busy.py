@@ -25,6 +25,7 @@ def normalize_response(models, response):
 
 def get_busy_levels(db, models):
     from admin import backend
+    from admin import maintenance
     from admin.models import Account
     from admin.account_binding import scope_accounts
     from sqlalchemy import or_
@@ -46,17 +47,23 @@ def get_busy_levels(db, models):
             return {k: v for k, v in cached.items() if k != "checked"}
         levels = {}
         try:
-            with backend.AccountSession(account.auth_json) as session:
-                try:
-                    for offset in range(0, len(models), 50):
-                        batch = models[offset:offset + 50]
-                        levels.update(normalize_response(batch, session.fetch_model_busy(batch)))
-                finally:
-                    account.auth_json = session.updated_json()
-            db.commit()
+            with maintenance.account_slot(account, db) as reason:
+                if reason:
+                    return {"levels": cached["levels"] if cached else unknown,
+                            "observed_at": cached["observed_at"] if cached else None,
+                            "stale": True, "skip_reason": reason}
+                with backend.AccountSession(account.auth_json) as session:
+                    try:
+                        for offset in range(0, len(models), 50):
+                            batch = models[offset:offset + 50]
+                            levels.update(normalize_response(batch, session.fetch_model_busy(batch)))
+                    finally:
+                        account.auth_json = session.updated_json()
+                db.commit()
             result = {"levels": levels, "observed_at": datetime.utcnow().isoformat() + "Z", "stale": False}
-        except Exception:
+        except Exception as error:
             db.rollback()
+            maintenance.note_failure(db, account, error)
             _logger.warning("上游模型繁忙程度获取失败，使用缓存或未知状态")
             result = {"levels": cached["levels"] if cached else unknown,
                       "observed_at": cached["observed_at"] if cached else None, "stale": True}

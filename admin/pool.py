@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import threading
@@ -155,11 +156,14 @@ class InFlight:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {}
+        self._maintenance: set[str] = set()
 
     def acquire(self, uid: str, limit: int) -> bool:
         if not uid:
             return True
         with self._lock:
+            if uid in self._maintenance:
+                return False
             cur = self._counts.get(uid, 0)
             if limit > 0 and cur >= limit:
                 return False
@@ -182,10 +186,28 @@ class InFlight:
             return self._counts.get(uid, 0)
 
     def full(self, uid: str, limit: int) -> bool:
-        if limit <= 0 or not uid:
+        if not uid:
             return False
         with self._lock:
-            return self._counts.get(uid, 0) >= limit
+            return uid in self._maintenance or (limit > 0 and self._counts.get(uid, 0) >= limit)
+
+    def acquire_maintenance(self, uid: str) -> bool:
+        """Reserve an idle identity while background work may rotate its token."""
+        if not uid:
+            return False
+        with self._lock:
+            if uid in self._maintenance or self._counts.get(uid, 0):
+                return False
+            self._maintenance.add(uid)
+            return True
+
+    def release_maintenance(self, uid: str) -> None:
+        with self._lock:
+            self._maintenance.discard(uid)
+
+    def maintenance_count(self) -> int:
+        with self._lock:
+            return len(self._maintenance)
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -276,7 +298,7 @@ class WafIpGate:
 
     def remaining(self) -> int:
         with self._lock:
-            return max(0, int(self._until - time.monotonic()))
+            return max(0, math.ceil(self._until - time.monotonic()))
 
     def reset(self) -> None:
         with self._lock:
@@ -706,10 +728,8 @@ class PoolRuntime:
     max_in_flight: int = 0
 
     def available(self, accounts: Iterable[Any]) -> list[Any]:
-        """过滤掉在途占满的账号（在途上限 <=0 时不过滤）。"""
+        """Exclude full or maintenance-reserved identities, even without a cap."""
         limit = getattr(self, "max_in_flight", 0) or 0
-        if limit <= 0:
-            return list(accounts)
         return [a for a in accounts if not self.inflight.full(getattr(a, "uid", "") or "", limit)]
 
     def acquire(self, uid: str) -> bool:

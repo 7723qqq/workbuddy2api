@@ -51,3 +51,22 @@
 .mobile-diagnostic-record summary { cursor: pointer; display: flex; flex-direction: column; gap: 5px; font-size: 13px; }
 .mobile-diagnostic-record small { color: var(--fg-muted); }
 .mobile-diagnostic-record p { font-size: 12px; margin: 8px 0; }
+.mobile-settings-card{padding:18px;margin-bottom:14px;overflow-wrap:anywhere}
+.mobile-settings-card h3{font-size:16px;font-weight:650;margin:0 0 12px}
+.mobile-settings-card p{font-size:13px;line-height:1.6;margin:8px 0}
+.mobile-settings-card .mobile-setting-hint{color:var(--fg-muted);font-size:12px}
+.mobile-setting-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.mobile-setting-actions{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+.mobile-setting-actions button{height:auto;min-height:42px;white-space:normal;padding:8px 12px}
+.mobile-setting-field{display:grid;gap:6px;font-size:13px;margin:14px 0}
+.mobile-setting-field select{width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg)}
+.mobile-service-address{font-family:monospace;user-select:text}
+.mobile-check-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:10px;border-bottom:1px solid var(--border);padding:12px 0;font-size:13px}
+.mobile-check-row small{display:block;color:var(--fg-muted);font-size:11px;margin-top:4px}
+.mobile-check-row>span{white-space:nowrap;font-variant-numeric:tabular-nums}
+.mobile-check-ok b{color:var(--brand-ink)}
+.mobile-check-failed b,.mobile-settings-card .mobile-check-failed{color:#dc4848}
+.mobile-speed-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0}
+.mobile-speed-metrics span{font-size:12px;color:var(--fg-muted);padding:12px;background:var(--bg);border-radius:10px}
+.mobile-speed-metrics b{display:block;color:var(--fg);font-size:16px;margin-top:6px;font-variant-numeric:tabular-nums}
+.mobile-speed-sample{font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word;user-select:text}

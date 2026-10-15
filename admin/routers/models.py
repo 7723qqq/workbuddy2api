@@ -8,6 +8,7 @@
 import httpx
 import json
 import time
+import threading
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -22,6 +23,7 @@ from admin.models import Account, ModelConfig
 from admin.security import require_admin
 
 router = APIRouter(prefix="/api/models", tags=["models"])
+_sync_lock = threading.Lock()
 
 
 class ModelToggleIn(BaseModel):
@@ -55,8 +57,6 @@ def _is_model_allowed(db: Session, model_id: str) -> bool:
     if not configs:
         return True  # 未配置任何模型规则，放行
     enabled = {m.model_id for m in configs if m.enabled == 1}
-    if not enabled:
-        return True  # 全部禁用视为未配置，放行
     return model_id in enabled
 
 
@@ -100,23 +100,50 @@ def model_busy(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
             "observed_at": result["observed_at"], "stale": result["stale"]}
 
 
-def _do_sync_models(db: Session) -> dict:
+def _do_sync_models(db: Session, account_id: int | None = None) -> dict:
+    with _sync_lock:
+        return _sync_models_locked(db, account_id)
+
+
+def _sync_models_locked(db: Session, account_id: int | None = None) -> dict:
     """从后端拉取可用模型列表并同步到本地数据库（upsert）。
 
-    需要一个有效账号来调用后端 API；优先选 active 且余额 > 0 的账号。
+    需要有效的 active 账号；余额为 0 也允许查询模型目录。
     """
-    acc = scope_accounts(db.query(Account)).filter(
-        Account.status == "active", Account.balance_remain > 0
-    ).first()
-    if not acc:
+    # A newly imported account can have a stale/empty local balance until its
+    # background refresh completes.  Model discovery only needs a valid token,
+    # so do not reject it based on the cached credit value.
+    query = db.query(Account).filter(Account.status == "active")
+    if account_id is not None:
+        query = query.filter(Account.id == account_id)
+    else:
+        query = scope_accounts(query)
+    candidates = query.order_by(Account.balance_remain.desc(), Account.id.asc()).limit(3).all()
+    if not candidates:
         raise HTTPException(status_code=503, detail="无可用账号（无法连接后端获取模型列表）")
-    try:
-        with backend.AccountSession(acc.auth_json) as sess:
-            models_raw = sess.fetch_models()
-            acc.auth_json = sess.updated_json()
-        db.commit()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"获取模型列表失败: {e}")
+    last_error = None
+    for acc in candidates:
+        try:
+            from admin import maintenance
+            with maintenance.account_slot(acc, db) as reason:
+                if reason:
+                    continue
+                original = acc.auth_json
+                with backend.AccountSession(original) as sess:
+                    models_raw = sess.fetch_models()
+                    updated_auth = sess.updated_json()
+                db.query(Account).filter(Account.id == acc.id, Account.auth_json == original).update(
+                    {Account.auth_json: updated_auth}, synchronize_session=False)
+                db.commit()
+                break
+        except Exception as error:
+            db.rollback()
+            maintenance.note_failure(db, acc, error)
+            last_error = error
+    else:
+        if last_error is None:
+            raise HTTPException(status_code=503, detail="账号处于保护或在途占用，稍后同步模型")
+        raise HTTPException(status_code=502, detail=f"获取模型列表失败: {last_error}")
 
     import re
 

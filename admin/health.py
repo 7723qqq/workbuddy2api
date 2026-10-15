@@ -3,11 +3,28 @@ from collections import Counter
 from datetime import datetime, timedelta
 import math
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 
 from admin.config import settings
 from admin.models import Account, AccountModelCooldown, ModelConfig, UsageLog
 from admin.pool import POOL
+
+
+def risk_health(db, now):
+    """Passive symptoms in gateway traffic, not an upstream risk score."""
+    from admin import maintenance
+    since = now - timedelta(minutes=15)
+    kind = case((UsageLog.error_kind == "", "success"), else_=UsageLog.error_kind)
+    rows = db.query(kind, func.count(UsageLog.id),
+                    func.count(func.distinct(UsageLog.account_id))).filter(
+        UsageLog.created_at >= since).group_by(kind).all()
+    reasons = {kind or "unknown": {"requests": count, "accounts": accounts}
+               for kind, count, accounts in rows}
+    return {"window_minutes": 15, "request_count": sum(r[1] for r in rows),
+            "observations": reasons,
+            "waf_active": POOL.waf.active(),
+            "waf_remaining_seconds": POOL.waf.remaining(),
+            "maintenance": maintenance.snapshot(), "source": "gateway_only"}
 
 
 def _percentiles(values):
@@ -69,6 +86,7 @@ def model_health(db, hours=24):
         reset = item["earliest_model_recovery"]
         item["earliest_model_recovery"] = reset.isoformat() + "Z" if reset else None
     return {"items": result, "usage_scope": "gateway_only", "range_hours": hours,
+            "risk": risk_health(db, now),
             "observed_at": now.isoformat() + "Z", "waf_remaining_seconds": waf,
             "latency_sample_limit": 2000, "daily_quota_remaining": None,
             "runtime_scope": "process_local"}

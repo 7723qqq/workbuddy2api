@@ -1,4 +1,4 @@
-"""Persist account IDs awaiting onboarding; run at most two workers."""
+"""Persistent onboarding with separate bounded reward and resource workers."""
 import json
 import logging
 import queue
@@ -14,6 +14,95 @@ _workers = []
 _lock = threading.Lock()
 _pending = set()
 _log = logging.getLogger(__name__)
+_RESOURCE_PREFIX = 'account_resources:'
+_resources = queue.Queue()
+_resource_workers = []
+_resource_pending = set()
+_model_init_lock = threading.Lock()
+
+
+def _resource_worker():
+    while True:
+        account_id = _resources.get()
+        try:
+            _save_resource(account_id, 'running')
+            from admin import backend
+            from admin.models import ModelConfig
+            from admin.routers.models import _do_sync_models
+            errors = []
+            with SessionLocal() as db:
+                acc = db.query(Account).filter(Account.id == account_id).first()
+                if not acc:
+                    continue
+                original = acc.auth_json
+            try:
+                with backend.AccountSession(original) as session:
+                    balance = session.fetch_balance()
+                    updated = session.updated_json()
+                with SessionLocal() as db:
+                    # Never overwrite a more recent login or token refresh.
+                    db.query(Account).filter(Account.id == account_id, Account.auth_json == original).update({
+                        Account.auth_json: updated,
+                        Account.balance_total: int(balance.get('total') or 0),
+                        Account.balance_remain: int(balance.get('remain') or 0),
+                        Account.last_sync_at: datetime.utcnow()}, synchronize_session=False)
+                    db.commit()
+            except backend.CredentialError as exc:
+                _save_resource(account_id, 'invalid_credential', [str(exc)])
+                _log.warning('账号凭证不完整，跳过资源初始化 account_id=%s', account_id)
+                continue
+            except Exception:
+                errors.append('余额刷新失败，可在账号页重试')
+                _log.exception('新增账号余额刷新失败 account_id=%s', account_id)
+            try:
+                # First-account initialization is independent of the slow reward
+                # queue. Preserve existing model toggles on subsequent imports.
+                with _model_init_lock, SessionLocal() as db:
+                    if db.query(ModelConfig).first() is None:
+                        _do_sync_models(db, account_id=account_id)
+            except Exception:
+                errors.append('初始模型同步失败，可在模型页重试')
+                _log.exception('初始模型同步失败 account_id=%s', account_id)
+            _save_resource(account_id, 'failed' if errors else 'completed', errors)
+        except Exception:
+            _log.exception('新增账号资源初始化失败 account_id=%s', account_id)
+            try:
+                _save_resource(account_id, 'failed', ['资源初始化失败，重启后会自动重试'])
+            except Exception:
+                _log.exception('资源初始化状态保存失败 account_id=%s', account_id)
+        finally:
+            with _lock:
+                _resource_pending.discard(account_id)
+            _resources.task_done()
+
+
+def _save_resource(account_id, status, errors=None):
+    with SessionLocal() as db:
+        key = _RESOURCE_PREFIX + str(account_id)
+        row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        if row is None:
+            row = SystemSetting(key=key)
+            db.add(row)
+        row.value = json.dumps({'status': status, 'errors': errors or [],
+                                'updated_at': datetime.utcnow().isoformat()}, ensure_ascii=False)
+        db.commit()
+
+
+def enqueue_resources(account_id):
+    """Balance/model initialization must not wait for growth tasks to finish."""
+    try:
+        with _lock:
+            if account_id in _resource_pending:
+                return
+            _save_resource(account_id, 'queued')
+            _resource_pending.add(account_id)
+            while len(_resource_workers) < 2:
+                worker = threading.Thread(target=_resource_worker, daemon=True, name='wb-account-resources')
+                worker.start()
+                _resource_workers.append(worker)
+            _resources.put(account_id)
+    except Exception:
+        _log.exception('新增账号资源任务提交失败 account_id=%s', account_id)
 
 
 def _dispatch():
@@ -101,10 +190,27 @@ def resume():
                 todo.append((acc.id, acc.name))
     for account_id, name in todo:
         enqueue(account_id, name)
+    from admin.models import ModelConfig
+    with SessionLocal() as db:
+        empty_models = db.query(ModelConfig).first() is None
+        resource_todo = set()
+        for row in db.query(SystemSetting).filter(SystemSetting.key.like(_RESOURCE_PREFIX + '%')):
+            try:
+                if json.loads(row.value).get('status') in ('queued', 'running', 'failed'):
+                    resource_todo.add(int(row.key[len(_RESOURCE_PREFIX):]))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        active = db.query(Account).filter(Account.status == 'active').all()
+        resource_todo.update(a.id for a in active if a.last_sync_at is None)
+        if empty_models and active:
+            resource_todo.add(active[0].id)
+        resource_todo.intersection_update(a.id for a in active)
+    for account_id in resource_todo:
+        enqueue_resources(account_id)
 
 
-def states(db, account_ids):
-    keys = [_PREFIX + str(aid) for aid in account_ids]
+def states(db, account_ids, prefix=_PREFIX):
+    keys = [prefix + str(aid) for aid in account_ids]
     if not keys:
         return {}
     out = {}
@@ -112,7 +218,7 @@ def states(db, account_ids):
         try:
             value = json.loads(row.value)
             if isinstance(value, dict):
-                out[int(row.key[len(_PREFIX):])] = value
+                out[int(row.key[len(prefix):])] = value
         except (ValueError, TypeError):
             pass
     return out

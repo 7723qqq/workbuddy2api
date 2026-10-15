@@ -83,7 +83,7 @@ print('source backend survives missing packaging; update endpoint returns 503')
         with tempfile.TemporaryDirectory() as work:
             service = UpdateService(Path(work))
             service.releases = [{"id": 1, "tag": "v99.0.0", "installable": True,
-                "asset": {"digest": "sha256:" + "a"*64,
+                "asset": {"name": "WorkBuddy2API-99.0.0-windows-x64.exe", "digest": "sha256:" + "a"*64,
                           "browser_download_url": f"https://github.com/{REPOSITORY}/releases/download/v99/a.exe"},
                 "checksum": None}]
             def fake_download(url, target, progress):
@@ -101,7 +101,7 @@ print('source backend survives missing packaging; update endpoint returns 503')
     def test_failed_check_preserves_history(self):
         with tempfile.TemporaryDirectory() as work:
             service = UpdateService(Path(work))
-            service.releases = [{"id": 1, "tag": "v99.0.0"}]
+            service.releases = [{"id": 1, "tag": "v99.0.0", "asset": {"name": "WorkBuddy2API-99.0.0-windows-x64.exe"}}]
             with patch("urllib.request.urlopen", side_effect=OSError("offline")):
                 result = service.check()
             self.assertTrue(result["available"])

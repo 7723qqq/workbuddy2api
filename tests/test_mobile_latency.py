@@ -81,7 +81,7 @@ class CredentialTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             token = jwt.encode({'exp': int(time.time())+3600}, 'test-only-key-at-least-32-characters', algorithm='HS256')
             path = Path(work)/'offline.info'
-            path.write_text(json.dumps({'auth': {'accessToken':token}, 'account':{}}))
+            path.write_text(json.dumps({'auth': {'accessToken':token, 'refreshToken':'offline-refresh'}, 'account':{}}))
             cm = converter.CredentialManager(path)
             with patch.object(cm, '_refresh') as refresh, \
                     patch.object(converter, 'client_user_agent', return_value='offline'), \

@@ -14,6 +14,8 @@ import android.webkit.*;
 import android.widget.*;
 import org.json.JSONObject;
 import com.chaquo.python.Python;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -25,14 +27,21 @@ public class MainActivity extends Activity {
     private Button details;
     private ValueCallback<Uri[]> upload;
     private String loadedOrigin;
+    private int loadedRevision;
     private boolean destroyed;
+    private volatile boolean bridgeTrusted;
     private Button restart;
+    private volatile String exportRequest;
+    private byte[] exportBytes;
+    private volatile boolean exportWriting;
     private final Runnable waitForServer = new Runnable() {
         @Override public void run() {
             if (destroyed) return;
             String origin = LocalApiService.origin;
-            if (origin != null && !origin.equals(loadedOrigin)) {
+            if (origin != null && !LocalApiService.starting &&
+                    (!origin.equals(loadedOrigin) || loadedRevision != LocalApiService.revision)) {
                 loadedOrigin = origin;
+                loadedRevision = LocalApiService.revision;
                 web.loadUrl(origin + "/admin?desktop=1&android=1");
             } else if (origin == null) {
                 boot.setVisibility(View.VISIBLE);
@@ -93,7 +102,7 @@ public class MainActivity extends Activity {
         GradientDrawable action = new GradientDrawable();
         action.setColor(Color.rgb(20, 134, 101)); action.setCornerRadius(dp(12));
         restart.setBackground(action); restart.setVisibility(View.GONE);
-        restart.setOnClickListener(view -> startLocalService());
+        restart.setOnClickListener(view -> startLocalService(true));
         card.addView(restart, new LinearLayout.LayoutParams(-1, dp(48)));
         details = new Button(this);
         details.setText("查看错误详情"); details.setTextSize(12); details.setTextColor(Color.rgb(101, 105, 112));
@@ -112,7 +121,11 @@ public class MainActivity extends Activity {
         web.getSettings().setSupportMultipleWindows(true);
         web.getSettings().setJavaScriptCanOpenWindowsAutomatically(false);
         web.getSettings().setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        web.addJavascriptInterface(new MobileBridge(), "WBAndroid");
         web.setWebViewClient(new WebViewClient() {
+            @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap icon) {
+                bridgeTrusted = isAdmin(url);
+            }
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return route(request.getUrl());
             }
@@ -158,11 +171,81 @@ public class MainActivity extends Activity {
     }
 
     private void startLocalService() {
-        if (LocalApiService.origin != null && loadedOrigin != null) {
-            web.loadUrl(loadedOrigin + "/admin?desktop=1&android=1"); return;
-        }
+        startLocalService(false);
+    }
+
+    private void startLocalService(boolean recover) {
         Intent service = new Intent(this, LocalApiService.class);
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(service); else startService(service);
+        if (recover) service.setAction("restart");
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(service); else startService(service);
+        } catch (RuntimeException e) {
+            LocalApiService.starting = false;
+            LocalApiService.error = "系统未能启动前台服务：" + e.getMessage();
+        }
+    }
+
+    private class MobileBridge {
+        @JavascriptInterface public synchronized boolean saveText(String request, String filename, String text, String mime) {
+            if (!bridgeTrusted || destroyed || request == null || !request.matches("[0-9]{1,10}") || exportRequest != null || exportWriting || text == null) return false;
+            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+            if (bytes.length > 32 * 1024 * 1024) return false;
+            String safe = filename == null ? "workbuddy-export.info" : filename.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_");
+            if (safe.length() > 120) safe = safe.substring(0, 120);
+            if (!safe.endsWith(".info") && !safe.endsWith(".json") && !safe.endsWith(".csv")) safe += ".info";
+            exportRequest = request;
+            exportBytes = bytes;
+            final String title = safe;
+            final String type = "text/csv".equals(mime) ? "text/csv" : "application/json";
+            handler.post(() -> {
+                if (destroyed) return;
+                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType(type).putExtra(Intent.EXTRA_TITLE, title);
+                try { startActivityForResult(intent, 12); }
+                catch (ActivityNotFoundException e) { finishExport(false, "找不到文件保存应用"); }
+            });
+            return true;
+        }
+        @JavascriptInterface public String status() {
+            if (!bridgeTrusted) return "{}";
+            JSONObject data = new JSONObject();
+            try {
+                android.app.NotificationManager manager = getSystemService(android.app.NotificationManager.class);
+                boolean notifications = manager.areNotificationsEnabled();
+                if (Build.VERSION.SDK_INT >= 26) {
+                    android.app.NotificationChannel channel = manager.getNotificationChannel("local-api");
+                    notifications &= channel != null && channel.getImportance() != android.app.NotificationManager.IMPORTANCE_NONE;
+                }
+                PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+                data.put("registered", LocalApiService.registered);
+                data.put("starting", LocalApiService.starting);
+                data.put("last_healthy", LocalApiService.lastHealthy);
+                data.put("notifications", notifications);
+                data.put("battery_unrestricted", power.isIgnoringBatteryOptimizations(getPackageName()));
+                data.put("origin", LocalApiService.origin);
+                data.put("error", LocalApiService.error);
+            } catch (Exception ignored) { }
+            return data.toString();
+        }
+        @JavascriptInterface public void restartService() {
+            if (bridgeTrusted) handler.post(() -> { if (!destroyed) startLocalService(true); });
+        }
+        @JavascriptInterface public void openSystemSettings(String section) {
+            if (!bridgeTrusted) return;
+            handler.post(() -> {
+                if (destroyed) return;
+                Intent intent;
+                if ("notifications".equals(section) && Build.VERSION.SDK_INT >= 26) {
+                    intent = new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName());
+                } else {
+                    intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                        Uri.parse("package:" + getPackageName()));
+                }
+                try { startActivity(intent); }
+                catch (ActivityNotFoundException e) { Toast.makeText(MainActivity.this, "无法打开系统设置", Toast.LENGTH_SHORT).show(); }
+            });
+        }
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
@@ -184,6 +267,8 @@ public class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume();
+        // Re-register the foreground service even when Python left an old origin in memory.
+        if (web != null) startLocalService();
         if (web != null) web.evaluateJavascript("window.dispatchEvent(new Event('wb-shell-resume'))", null);
         if (LocalApiService.origin != null && Python.isStarted()) new Thread(() -> {
             try {
@@ -200,8 +285,43 @@ public class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == 10 && upload != null) {
-            upload.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result, data)); upload = null;
+            Uri[] selected = null;
+            if (result == RESULT_OK && data != null && data.getClipData() != null) {
+                ClipData clips = data.getClipData();
+                selected = new Uri[clips.getItemCount()];
+                for (int i = 0; i < clips.getItemCount(); i++) selected[i] = clips.getItemAt(i).getUri();
+            } else selected = WebChromeClient.FileChooserParams.parseResult(result, data);
+            upload.onReceiveValue(selected); upload = null;
         }
+        if (request == 12 && exportRequest != null) {
+            if (result != RESULT_OK || data == null || data.getData() == null) {
+                finishExport(false, "已取消保存");
+                return;
+            }
+            final Uri target = data.getData();
+            final byte[] content = exportBytes;
+            exportWriting = true;
+            new Thread(() -> {
+                boolean success = false;
+                try (OutputStream output = getContentResolver().openOutputStream(target, "wt")) {
+                    if (output == null || content == null) throw new java.io.IOException("No writable document");
+                    output.write(content);
+                    output.flush();
+                    success = true;
+                } catch (Exception e) {
+                    success = false;
+                    android.util.Log.e("WorkBuddyExport", "Document write failed: " + e.getClass().getSimpleName());
+                }
+                final boolean saved = success;
+                handler.post(() -> finishExport(saved, saved ? "文件已保存" : "文件写入失败，请更换保存位置"));
+            }, "workbuddy-file-export").start();
+        }
+    }
+    private void finishExport(boolean success, String message) {
+        String id = exportRequest;
+        exportRequest = null; exportBytes = null; exportWriting = false;
+        if (!destroyed && bridgeTrusted && id != null)
+            web.evaluateJavascript("window.WBMobile && WBMobile.saveResult(" + JSONObject.quote(id) + "," + success + "," + JSONObject.quote(message) + ")", null);
     }
     @Override public void onBackPressed() {
         if (web != null && isAdmin(web.getUrl())) web.evaluateJavascript("if(document.querySelector('dialog[open]'))document.querySelector('dialog[open]').close();else if(!document.getElementById('modal').classList.contains('hidden'))closeModal();else closeSideMenu();", null);
@@ -209,6 +329,7 @@ public class MainActivity extends Activity {
     }
     @Override protected void onDestroy() {
         destroyed = true; handler.removeCallbacksAndMessages(null);
+        bridgeTrusted = false;
         if (upload != null) upload.onReceiveValue(null);
         if (web != null) web.destroy();
         super.onDestroy();

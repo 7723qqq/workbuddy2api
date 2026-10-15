@@ -1,22 +1,19 @@
 """复用 converter.CredentialManager 操作单个账号的后端会话。
 
-账号凭据以 .info 原文形式存于 MySQL；用时落盘成临时文件交给 CredentialManager，
-用完读回（token 可能被刷新），写回 MySQL。
+账号凭据存于数据库；会话在内存中读取与刷新，用完写回数据库。
 """
 import json
 import os
 import re
 import sys
-import tempfile
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 
-from converter import BACKEND, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
+from converter import BACKEND, CredentialError, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
 
 #: 项目根加入 sys.path，便于导入根目录的 wb_install（与 converter 同级）。
 #: admin 包可能在 `uvicorn admin.server:app` 下被导入，此时根目录不一定在
@@ -220,10 +217,7 @@ class AccountSession:
 
     def __init__(self, auth_json: str):
         self._http = None
-        self._path = tempfile.mktemp(suffix=".info")
-        with open(self._path, "w", encoding="utf-8") as f:
-            f.write(auth_json)
-        self.cm = CredentialManager(Path(self._path))
+        self.cm = CredentialManager.from_json(auth_json)
 
     @contextmanager
     def http_client(self, timeout=15):
@@ -415,9 +409,43 @@ class AccountSession:
         """派出猫旅行。4 个地点收益/时长区间完全相同，固定用 4（古镇客栈）。"""
         return self._growth("POST", "/activity/growth/buddy/travel/depart", {"location_id": location_id})
 
-    def travel_claim(self, record_id: int) -> dict:
-        """领取到站奖励；成功时 data.reward_credit 为实发积分。"""
-        return self._growth("POST", "/activity/growth/buddy/travel/claim", {"record_id": record_id})
+    def travel_claim(self, record_id: int | None = None) -> dict:
+        """领取到站奖励；新接口只接受空 JSON，保留参数兼容旧调用方。"""
+        # record_id 曾经是旧接口的必填字段。新版按当前账号唯一的未领取旅程
+        # 结算，携带旧字段会被部分网关拒绝，因此统一发空对象。
+        return self._growth("POST", "/activity/growth/buddy/travel/claim", {})
+
+    # ------------------------------------------------------------------
+    # 成长计划的轻量接口。它们全部复用当前 AccountSession，调度器逐号
+    # 直接调用，不经过账号池选号（否则长期低权重账号永远不会活跃）。
+    # ------------------------------------------------------------------
+
+    def growth_energy(self) -> dict:
+        return self._growth("GET", "/activity/growth/energy")
+
+    def growth_buddy_quota(self) -> dict:
+        return self._growth("GET", "/activity/growth/buddy/quota")
+
+    def growth_buddy_open(self, count: int = 1) -> dict:
+        return self._growth("POST", "/activity/growth/buddy/open", {"count": max(1, int(count))})
+
+    def growth_heatmap(self) -> dict:
+        """读取活跃地图；data.today.is_active 才代表当天已使用。"""
+        return self._growth("GET", "/activity/growth/heatmap")
+
+    def growth_streak(self) -> dict:
+        return self._growth("GET", "/activity/growth/streak")
+
+    def growth_redeem(self, tier: str, client_token: str) -> dict:
+        return self._growth("POST", "/activity/growth/redeem",
+                            {"tier": tier, "client_token": client_token})
+
+    def growth_lottery_chances(self) -> dict:
+        return self._growth("GET", "/activity/growth/lottery/chances")
+
+    def growth_lottery_draw(self, client_token: str) -> dict:
+        return self._growth("POST", "/activity/growth/lottery/draw",
+                            {"client_token": client_token})
 
     def _is_threshold_not_met(self, res: dict) -> bool:
         """判定「领养门槛未达标」：HTTP 400 + first_buddy 关键词。"""
@@ -567,11 +595,7 @@ class AccountSession:
 
         # ── 4) 到站领奖 / 空闲派出 ─────────────────────────────────────
         if state == "arrived":
-            if record_id <= 0:
-                add("claim", False, "已到站但缺少 record_id，无法领奖")
-                return {"ok": False, "credits": credits, "steps": steps,
-                        "summary": "领奖失败（缺少 record_id）", "outcome": "error"}
-            cl = self.travel_claim(record_id)
+            cl = self.travel_claim()
             if cl["ok"]:
                 reward = int((cl["data"] or {}).get("reward_credit") or 0)
                 add("claim", True, f"领奖成功，获得 {reward} 积分", reward=reward)
@@ -1651,8 +1675,7 @@ class AccountSession:
         return ""
 
     def updated_json(self) -> str:
-        with open(self._path, "r", encoding="utf-8") as f:
-            return f.read()
+        return self.cm.export_json()
 
     def __enter__(self):
         return self
@@ -1664,10 +1687,6 @@ class AccountSession:
         if self._http is not None:
             self._http.close()
             self._http = None
-        try:
-            os.unlink(self._path)
-        except OSError:
-            pass
 
 
 def _map_checkin_status(code: int) -> str:

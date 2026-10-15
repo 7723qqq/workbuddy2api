@@ -555,6 +555,8 @@ def _run_post_login_automation(account_id: int, name: str) -> dict:
 
 def _schedule_post_login_automation(account_id: int, name: str) -> None:
     """Persist and queue onboarding without blocking the login response."""
+    from admin.post_login import enqueue_resources
+    enqueue_resources(account_id)
     if not POST_LOGIN_AUTOMATION:
         return
     try:
