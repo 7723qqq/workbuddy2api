@@ -94,21 +94,35 @@ def anthropic_request_to_chat(body: dict) -> dict:
     # 上游只认扁平的 reasoning_effort，且**不识别** budget_tokens（实测传
     # thinking/budget_tokens 都被静默忽略，reasoning_content 为空）。
     # 因此这里把「要不要思考」翻译成 reasoning_effort：
-    #   - thinking.type == "disabled" → 显式关闭
-    #   - thinking.type == "enabled"  → 有档位则用档位，否则给默认 high
+    #   - thinking.type == "disabled"  → 显式关闭
+    #   - thinking.type == "enabled"   → 有档位则用档位，否则给默认 high
+    #   - thinking.type == "adaptive"  → 同 enabled。这是 Kimi CLI（kosong
+    #     客户端，adaptive_thinking=true 的模型）的写法，请求形态为
+    #     thinking={"type":"adaptive","display":"summarized"} +
+    #     output_config={"effort":"max"}。旧版不识别 adaptive 且完全忽略
+    #     output_config.effort，两个字段被静默丢弃 → 上游收不到任何思考
+    #     指令 → 客户端表现为「模型不思考」。
+    # 档位来源优先级：thinking.effort > output_config.effort > 默认 high
     # （实测 high 是 deepseek 系上游的默认档，且必然开启思维链）
+    output_config = body.get("output_config")
+    effort_hint = ""
+    if isinstance(output_config, dict):
+        _e = output_config.get("effort")
+        if isinstance(_e, str) and _e.strip():
+            effort_hint = _e.strip()
+
     thinking = body.get("thinking")
     if isinstance(thinking, dict):
         ttype = str(thinking.get("type") or "").strip().lower()
         if ttype == "disabled":
             chat["thinking"] = {"type": "disabled"}
-        elif ttype == "enabled":
-            effort = thinking.get("effort")
+        elif ttype in ("enabled", "adaptive"):
+            effort = thinking.get("effort") or effort_hint
             if not (isinstance(effort, str) and effort.strip()):
                 effort = "high"
             chat.setdefault("reasoning_effort", effort.strip())
-    elif isinstance(thinking, str) and thinking.strip().lower() == "enabled":
-        chat.setdefault("reasoning_effort", "high")
+    elif isinstance(thinking, str) and thinking.strip().lower() in ("enabled", "adaptive"):
+        chat.setdefault("reasoning_effort", effort_hint or "high")
 
     return chat
 
