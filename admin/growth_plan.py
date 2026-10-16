@@ -369,6 +369,16 @@ def run_growth_plan(db, *, budget_seconds=180, progress=None, now=None, lease=No
                     return value
 
                 result = _account_plan(sess, state, save, observed_call, day, model)
+                if result.get("credit", 0) > 0:
+                    from admin.routers.accounts import _sync_credit_snapshot
+                    try:
+                        balance = sess.fetch_balance()
+                        account.balance_total = int(balance.get("total") or 0)
+                        account.balance_remain = int(balance.get("remain") or 0)
+                        account.last_sync_at = datetime.utcnow()
+                        _sync_credit_snapshot(account, sess.fetch_credit_details())
+                    except Exception:
+                        result["resource_refresh_failed"] = True
             except Exception as exc:
                 result = {"ok": False, "credit": 0, "reason": f"账号会话失败（{type(exc).__name__}）"}
             finally:

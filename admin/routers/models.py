@@ -9,6 +9,8 @@ import httpx
 import json
 import time
 import threading
+import statistics
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -24,6 +26,7 @@ from admin.security import require_admin
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 _sync_lock = threading.Lock()
+_probe_lock = threading.Lock()
 
 
 class ModelToggleIn(BaseModel):
@@ -34,6 +37,29 @@ class ModelBatchIn(BaseModel):
     model_ids: list[str] = []
     enabled: bool = True
     level: str = "system"  # system | user
+
+
+class ModelDisplayIn(BaseModel):
+    show_multiplier: bool = True
+    show_busy: bool = True
+
+
+@router.get("/display")
+def model_display(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    from admin.model_listing import display_options
+    return display_options(db)
+
+
+@router.put("/display")
+def save_model_display(body: ModelDisplayIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    from admin.models import SystemSetting
+    row = db.get(SystemSetting, "model_display")
+    if row is None:
+        row = SystemSetting(key="model_display")
+        db.add(row)
+    row.value = json.dumps(body.dict())
+    db.commit()
+    return body.dict()
 
 
 def _get_enabled_models(db: Session) -> set[str]:
@@ -228,14 +254,12 @@ def batch_toggle(
     db: Session = Depends(get_db),
 ):
     """批量启用/禁用模型。"""
-    count = 0
-    for mid in body.model_ids:
-        mc = db.query(ModelConfig).filter(
-            ModelConfig.model_id == mid, ModelConfig.level == body.level
-        ).first()
-        if mc:
-            mc.enabled = 1 if body.enabled else 0
-            count += 1
+    if body.level not in ("system", "user"):
+        raise HTTPException(400, "无效模型级别")
+    query = db.query(ModelConfig).filter(ModelConfig.level == body.level)
+    if body.model_ids:
+        query = query.filter(ModelConfig.model_id.in_(body.model_ids))
+    count = query.update({ModelConfig.enabled: int(body.enabled)}, synchronize_session=False)
     db.commit()
     return {"updated": count, "enabled": body.enabled}
 
@@ -270,42 +294,45 @@ async def speed_test(
     _: bool = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """用账号池直接对上游发一次流式请求测速（无需 API Key）。
+    if not _probe_lock.acquire(blocking=False):
+        raise HTTPException(429, "已有模型检测正在进行", headers={"Retry-After": "3"})
+    try:
+        return await _speed_test_run(body, request, db)
+    finally:
+        _probe_lock.release()
 
-    测量指标：首字延迟 TTFT、输出 token 数、生成速度(t/s)、端到端耗时。
-    仅占用一个可用账号做一次真实上游请求，不扣积分、不改额度。
-    """
-    model = (body.get("model") or "").strip()
+
+async def _speed_test_run(body, request, db):
+    """A real, bounded model request; upstream may charge credits."""
+    model = str(body.get("model") or "").strip()
     if not model:
         raise HTTPException(status_code=400, detail="缺少 model")
     try:
-        max_tokens = int(body.get("max_tokens") or 256)
+        max_tokens = max(16, min(512, int(body.get("max_tokens") or 64)))
     except (TypeError, ValueError):
-        max_tokens = 256
+        max_tokens = 64
     messages = body.get("messages") or _SPEED_TEST_PROMPT
 
-    # 选可用账号（与代理一致：active 且余额>0，剩余最多优先）
-    acc = scope_accounts(db.query(Account)).filter(
-        Account.status == "active", Account.balance_remain > 0
-    ).order_by(Account.balance_remain.desc()).first()
-    if not acc:
-        # 文案如实：这个接口只挑「启用且余额>0」，**不看在途/冷却**，
-        # 所以「全部禁用或额度耗尽」这句话经常是错的（例如账号只是被临时限流）。
-        total = db.query(Account).count()
-        active = db.query(Account).filter(Account.status == "active").count()
-        raise HTTPException(
-            status_code=503,
-            detail=(f"无可用账号：共 {total} 个账号，其中启用 {active} 个，"
-                    f"但没有任何「启用且余额大于 0」的账号"
-                    f"（本接口不判断在途与冷却状态）"))
-
-    from admin.routers.proxy import _blocking_call
+    if not _is_model_allowed(db, model):
+        raise HTTPException(400, "模型未启用")
+    from admin.routers.proxy import (_blocking_call, _select_account, _classify_error,
+                                     _apply_account_policy, _parse_usage, _looks_like_inband_error,
+                                     _error_reset_at)
+    from admin.pool import POOL
+    if POOL.waf.active():
+        raise HTTPException(503, "出口保护中，稍后检测", headers={"Retry-After": str(max(1, POOL.waf.remaining()))})
+    acc = await _blocking_call(_select_account, db, model=model, mark_picked=False)
+    if not acc or not POOL.acquire(acc.uid or ""):
+        raise HTTPException(503, "当前没有可检测账号（冷却或正在使用），稍后重试", headers={"Retry-After": "3"})
     from admin import upstream_http
-    sess = backend.AccountSession(acc.auth_json)
+    sess = None
     try:
+        sess = await _blocking_call(backend.AccountSession, acc.auth_json, on_cancel=lambda session: session.close())
         headers = await _blocking_call(sess.get_headers)
     except BaseException:
-        sess.close()
+        if sess is not None:
+            sess.close()
+        POOL.release(acc.uid or "")
         raise
     url = f"{settings.BACKEND}/v2/chat/completions"
     payload = {
@@ -323,34 +350,57 @@ async def speed_test(
     prompt_tokens = None
     sample = ""
     sample_len = 0
+    intervals = []
+    previous_delta = None
+    headers_ms = None
+    completed = False
+    raw_lines = []
+    failure_kind = "transport"
 
     def _persist():
         try:
             acc.auth_json = sess.updated_json()  # 写回可能刷新的 token
+            from admin.models import UsageLog
+            usage = _parse_usage('\n'.join(raw_lines)) if completed else {}
+            db.add(UsageLog(account_id=acc.id, model=model, api_key_id=0, use_case="model-probe",
+                            error_kind="success" if completed else failure_kind,
+                            ttfb_ms=round(ttft * 1000) if ttft is not None else None,
+                            latency_ms=round((time.perf_counter() - t0) * 1000),
+                            credits=usage.get('credits') or 0, prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens, total_tokens=total_tokens))
             db.commit()
         except Exception:
-            pass
+            db.rollback()
 
     try:
         async with upstream_http.client(request, 120, backend.HTTP_LIMITS) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
+                headers_ms = round((time.perf_counter() - t0) * 1000, 1)
                 if r.status_code >= 400:
                     detail = await r.aread()
                     msg = detail.decode("utf-8", "replace")[:300]
-                    await _blocking_call(_persist)
-                    sess.close()
+                    failure_kind = _classify_error(r.status_code, msg)
+                    await _blocking_call(_apply_account_policy, db, acc, failure_kind, r.status_code, msg,
+                                         model=model, reset_at=_error_reset_at(r.headers, msg))
                     raise HTTPException(status_code=r.status_code, detail=f"上游返回错误: {msg}")
-                async for chunk in r.aiter_text():
+                async for chunk in r.aiter_lines():
                     # TTFT：首个非空增量（content 或 reasoning_content）即首字延迟
-                    if ttft is None and chunk.strip():
-                        ttft = time.perf_counter() - t0
                     for line in chunk.splitlines():
                         line = line.strip()
                         if not line.startswith("data:"):
                             continue
                         p = line[5:].strip()
-                        if not p or p == "[DONE]":
+                        if p == "[DONE]":
+                            completed = True
                             continue
+                        if not p:
+                            continue
+                        raw_lines.append('data: ' + p)
+                        if _looks_like_inband_error(p):
+                            failure_kind = _classify_error(200, p)
+                            await _blocking_call(_apply_account_policy, db, acc, failure_kind, 200, p, model=model,
+                                                 reset_at=_error_reset_at(r.headers, p))
+                            raise HTTPException(502, "上游模型返回错误，请查看账号模型冷却状态")
                         try:
                             obj = json.loads(p)
                         except Exception:
@@ -364,24 +414,47 @@ async def speed_test(
                             if usage.get("total_tokens") is not None:
                                 total_tokens = usage["total_tokens"]
                         for ch in obj.get("choices") or []:
+                            if ch.get('finish_reason') is not None:
+                                completed = True
                             delta = ch.get("delta") or {}
                             # 推理类模型把思考内容放在 reasoning_content（content 可能为空），
                             # 样例优先取 content，缺省回退 reasoning_content，保证总能看到输出。
                             piece = (delta.get("content") or "") or (delta.get("reasoning_content") or "")
+                            if piece:
+                                now = time.perf_counter()
+                                if ttft is None:
+                                    ttft = now - t0
+                                if previous_delta is not None:
+                                    intervals.append((now - previous_delta) * 1000)
+                                previous_delta = now
                             if piece and sample_len < 400:
                                 add = piece[:400 - sample_len]
                                 sample += add
                                 sample_len += len(add)
+            if ttft is None or not completed:
+                completed = False
+                raise HTTPException(502, "测速流未完整结束或未返回有效文字")
             t_end = time.perf_counter()
     except HTTPException:
+        completed = False
         raise
     except Exception as e:
-        await _blocking_call(_persist)
-        sess.close()
+        completed = False
         raise HTTPException(status_code=502, detail=f"测速请求失败: {e}")
-
-    await _blocking_call(_persist)
-    sess.close()
+    except BaseException:
+        completed = False
+        failure_kind = "cancelled"
+        raise
+    finally:
+        import anyio
+        with anyio.CancelScope(shield=True):
+            try:
+                await _blocking_call(_persist)
+            finally:
+                sess.close()
+                POOL.release(acc.uid or "")
+        from admin.post_login import enqueue_resources
+        enqueue_resources(acc.id)
 
     total_dur = t_end - t0
     gen_dur = (total_dur - ttft) if ttft is not None else total_dur
@@ -393,6 +466,13 @@ async def speed_test(
     meta = backend.parse_auth_meta(acc.auth_json)
     return {
         "model": model,
+        "health": "healthy",
+        "observed_at": datetime.utcnow().isoformat() + 'Z',
+        "headers_ms": headers_ms,
+        "inter_delta_jitter_ms": round(statistics.pstdev(intervals), 1) if len(intervals) >= 2 else None,
+        "jitter_samples": len(intervals),
+        "jitter_scope": "inter_delta_including_generation",
+        "prompt_tokens": prompt_tokens,
         "account": meta.get("nickname") or meta.get("uid") or "",
         "ttft_ms": ttft_ms,
         "completion_tokens": completion_tokens,

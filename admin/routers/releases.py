@@ -5,7 +5,7 @@ import os
 import secrets
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from admin.security import require_admin
 from desktop.common import ROOT, VERSION, RELEASES_URL
@@ -16,6 +16,13 @@ router = APIRouter(prefix="/api/app", tags=["releases"])
 @router.get("/version")
 def version():
     return {"version": VERSION, "releases_url": RELEASES_URL}
+
+
+@router.get("/network", dependencies=[Depends(require_admin)])
+def network(request: Request):
+    from admin.network import lan_ipv4
+    server = request.scope.get("server") or ("", 8790)
+    return {"lan_ips": lan_ipv4(), "port": server[1]}
 
 
 @router.get("/request-timings", dependencies=[Depends(require_admin)])

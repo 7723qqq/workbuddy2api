@@ -1,4 +1,4 @@
-"""Read WorkBuddy's encrypted .info fields without changing the client files.
+"""Read and write WorkBuddy's encrypted .info fields.
 
 The installed Electron binary supplies its own build key in Node mode. Keys
 stay in memory; no bundled keys, GUI launch, or key files are required.
@@ -64,8 +64,22 @@ def _installed_key(executable: str, mtime: int, size: int) -> tuple[str, bytes]:
 
 
 def _local_key() -> tuple[str, bytes]:
+    configured = os.getenv('WORKBUDDY_CREDENTIAL_KEY_FILE')
+    key_file = Path(configured) if configured else Path(__file__).resolve().parents[1] / '.workbuddy' / 'credential-key.json'
+    if configured or key_file.exists():
+        try:
+            if key_file.stat().st_size > 4096:
+                raise ValueError()
+            value = json.loads(key_file.read_text(encoding='utf-8'))
+            key = _base64(value['key'])
+            key_id = hashlib.sha256(key).hexdigest()[:16]
+            if len(key) != 32 or value['keyId'] != key_id or not any(key):
+                raise ValueError()
+            return key_id, key
+        except Exception:
+            raise CredentialDecodeError('凭证加密运行配置无效，请管理员重新配置官方客户端加密能力') from None
     if os.name != 'nt' or os.getenv('WORKBUDDY_ANDROID') == '1':
-        raise CredentialDecodeError('这是新版客户端加密凭证，请在安装 WorkBuddy 的 Windows 电脑导入后导出，或使用手机号授权登录')
+        raise CredentialDecodeError('未配置官方客户端加密能力，请管理员配置 WORKBUDDY_CREDENTIAL_KEY_FILE；也可使用明文备份或手机号授权登录')
     from wb_install import WB
     install = WB.install_dir()
     executable = Path(install) / 'WorkBuddy.exe' if install else None
@@ -134,3 +148,37 @@ def normalize_credential(raw: str) -> str:
 
     decoded = visit(data)
     return json.dumps(decoded, ensure_ascii=False) if changed else raw.lstrip('\ufeff')
+
+
+def encrypt_credential(raw: str) -> str:
+    """Official standard field framing; fresh nonce per field and per export."""
+    data = json.loads(normalize_credential(raw))
+    if not isinstance(data, dict) or not isinstance(data.get('auth'), dict):
+        raise CredentialDecodeError('凭证结构无效，无法导出客户端文件')
+    key_id, key = _local_key()
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    cipher = AESGCM(key)
+
+    def protect(area, names):
+        if not isinstance(area, dict):
+            return
+        for name in names:
+            value = area.get(name)
+            if not isinstance(value, str) or not value:
+                continue
+            nonce = os.urandom(12)
+            sealed = cipher.encrypt(nonce, value.encode('utf-8'), _aad(key_id))
+            envelope = {'suite': 1, 'keyId': key_id,
+                        'nonce': base64.b64encode(nonce).decode('ascii'),
+                        'authTag': base64.b64encode(sealed[-16:]).decode('ascii'),
+                        'ciphertext': base64.b64encode(sealed[:-16]).decode('ascii')}
+            area[name] = {'$wbEncrypted': 1, 'envelope': base64.b64encode(
+                json.dumps(envelope, separators=(',', ':')).encode('utf-8')).decode('ascii')}
+
+    protect(data['auth'], ('accessToken', 'refreshToken'))
+    profile_fields = ('phoneNumber', 'nickname', 'departmentFullName')
+    protect(data.get('account'), profile_fields)
+    for group in ('accounts', 'allAccounts'):
+        for account in data.get(group, []) if isinstance(data.get(group), list) else []:
+            protect(account, profile_fields)
+    return json.dumps(data, ensure_ascii=False)

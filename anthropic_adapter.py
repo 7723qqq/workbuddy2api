@@ -97,18 +97,23 @@ def anthropic_request_to_chat(body: dict) -> dict:
     #   - thinking.type == "disabled" → 显式关闭
     #   - thinking.type == "enabled"  → 有档位则用档位，否则给默认 high
     # （实测 high 是 deepseek 系上游的默认档，且必然开启思维链）
+    output_config = body.get("output_config")
+    effort_hint = output_config.get("effort") if isinstance(output_config, dict) else None
+    effort_hint = effort_hint.strip() if isinstance(effort_hint, str) else ""
     thinking = body.get("thinking")
     if isinstance(thinking, dict):
         ttype = str(thinking.get("type") or "").strip().lower()
         if ttype == "disabled":
             chat["thinking"] = {"type": "disabled"}
-        elif ttype == "enabled":
+        elif ttype in ("enabled", "adaptive"):
             effort = thinking.get("effort")
+            if not isinstance(effort, str) or not effort.strip():
+                effort = effort_hint
             if not (isinstance(effort, str) and effort.strip()):
                 effort = "high"
             chat.setdefault("reasoning_effort", effort.strip())
-    elif isinstance(thinking, str) and thinking.strip().lower() == "enabled":
-        chat.setdefault("reasoning_effort", "high")
+    elif isinstance(thinking, str) and thinking.strip().lower() in ("enabled", "adaptive"):
+        chat.setdefault("reasoning_effort", effort_hint or "high")
 
     return chat
 

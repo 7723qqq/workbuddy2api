@@ -46,9 +46,9 @@ def select_port(preferred: int) -> int:
                 probe.settimeout(.2)
                 if probe.connect_ex(("127.0.0.1", preferred)) == 0:
                     raise OSError("Port already in use")
-            sock.bind(("127.0.0.1", preferred))
+            sock.bind(("0.0.0.0", preferred))
         except OSError:
-            sock.bind(("127.0.0.1", 0))
+            sock.bind(("0.0.0.0", 0))
         return sock.getsockname()[1]
 
 
@@ -72,7 +72,7 @@ def configure_environment(base: Path) -> dict:
         atomic_json(file, config)
     os.environ.update({"WORKBUDDY_DESKTOP": "1", "WORKBUDDY_DESKTOP_DATA": str(base),
                        "ADMIN_DATABASE_URL": "sqlite:///" + (base / "workbuddy.db").as_posix(),
-                       "ADMIN_GATEWAY_LIMIT_BACKEND": "memory", "ADMIN_HOST": "127.0.0.1",
+                       "ADMIN_GATEWAY_LIMIT_BACKEND": "memory", "ADMIN_HOST": "0.0.0.0",
                        "ADMIN_USERNAME": config["username"], "ADMIN_PASSWORD": config["password"],
                        "ADMIN_JWT_SECRET": config["jwt_secret"], "PYTHONUTF8": "1",
                        "CONVERTER_API_KEY": config["converter_api_key"],
@@ -127,7 +127,7 @@ def backend(port: int):
                 return
             time.sleep(1)
     threading.Thread(target=runtime_watch, daemon=True).start()
-    uvicorn.run(app, host="127.0.0.1", port=port, log_config=None, access_log=False,
+    uvicorn.run(app, host="0.0.0.0", port=port, log_config=None, access_log=False,
                 loop="asyncio", http="h11", ws="none", timeout_graceful_shutdown=5)
 
 
@@ -203,8 +203,7 @@ class DesktopAPI:
         from datetime import datetime, timedelta, timezone
         import jwt
         # Local ownership authenticates the shell; no password form or login request.
-        token = jwt.encode({"sub": self.config["username"],
-                            "exp": datetime.now(timezone.utc) + timedelta(hours=24)},
+        token = jwt.encode({"sub": self.config["username"], "local_shell": True},
                            self.config["jwt_secret"], algorithm="HS256")
         return {"token": token}
 
@@ -430,8 +429,7 @@ class DesktopAPI:
             return {"error": "服务未就绪"}
         from datetime import datetime, timedelta, timezone
         import jwt
-        token = jwt.encode({"sub": self.config["username"],
-                            "exp": datetime.now(timezone.utc) + timedelta(hours=24)},
+        token = jwt.encode({"sub": self.config["username"], "local_shell": True},
                            self.config["jwt_secret"], algorithm="HS256")
         url = f"http://127.0.0.1:{port}/admin?token={token}"
         webbrowser.open(url)

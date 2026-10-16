@@ -56,7 +56,8 @@ window.WBMobileSettings = (() => {
     const title = state.starting ? '正在启动 / 恢复' : state.registered ? '系统前台服务已注册' : '系统服务未注册';
     el('mobileServiceState').innerHTML = `<p><b>${esc(title)}</b></p><p class="mobile-service-address">${esc(state.origin || location.origin)}/v1</p>
       <p>运行通知：${state.notifications ? '已允许' : '未允许或通知通道关闭'}</p>
-      <p>电池优化：${state.battery_unrestricted ? '不受限制' : '受系统管理，可在应用设置中允许后台运行'}</p>
+      <p>电池优化：${state.battery_unrestricted ? '不受限制' : '尚未授权后台高耗电'}</p>
+      <p>后台运行：${state.background_restricted ? '被系统限制' : '未被限制'} · CPU 保活：${state.wake_lock ? '已启用' : '未启用'}${state.power_save ? ' · 省电模式已开启' : ''}</p>
       ${state.last_healthy ? `<p>最近监听检查：${esc(new Date(state.last_healthy).toLocaleTimeString())}</p>` : ''}
       ${state.error ? `<p class="mobile-check-failed">${esc(state.error)}</p>` : ''}`;
   }

@@ -38,15 +38,29 @@ def _resource_worker():
             try:
                 with backend.AccountSession(original) as session:
                     balance = session.fetch_balance()
+                    from admin.routers.accounts import _sync_credit_snapshot
+                    try:
+                        _sync_credit_snapshot(acc, session.fetch_credit_details())
+                    except Exception:
+                        errors.append('积分到期快照刷新失败，可在账号页重试')
                     updated = session.updated_json()
                 with SessionLocal() as db:
                     # Never overwrite a more recent login or token refresh.
-                    db.query(Account).filter(Account.id == account_id, Account.auth_json == original).update({
+                    updates = {
                         Account.auth_json: updated,
                         Account.balance_total: int(balance.get('total') or 0),
                         Account.balance_remain: int(balance.get('remain') or 0),
-                        Account.last_sync_at: datetime.utcnow()}, synchronize_session=False)
+                        Account.last_sync_at: datetime.utcnow()}
+                    if acc.credits_synced_at is not None:
+                        for field in ('credits_snapshot', 'credits_synced_at', 'credits_expiring',
+                                      'credits_expiring_soon', 'credits_evergreen', 'credits_expired',
+                                      'credits_soonest_expire_at'):
+                            updates[getattr(Account, field)] = getattr(acc, field)
+                    changed = db.query(Account).filter(Account.id == account_id, Account.auth_json == original).update(
+                        updates, synchronize_session=False)
                     db.commit()
+                    if not changed:
+                        errors.append('账号凭证已变更，请重新刷新资源')
             except backend.CredentialError as exc:
                 _save_resource(account_id, 'invalid_credential', [str(exc)])
                 _log.warning('账号凭证不完整，跳过资源初始化 account_id=%s', account_id)

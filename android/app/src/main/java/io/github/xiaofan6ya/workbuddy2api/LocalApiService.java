@@ -22,10 +22,13 @@ public class LocalApiService extends Service {
     private int instanceGeneration;
     private Thread worker;
     private PowerManager.WakeLock wakeLock;
+    private static volatile boolean wakeLockActive;
+    static boolean wakeLockHeld() { return wakeLockActive; }
     private volatile boolean stopping;
     private final Handler monitor = new Handler(Looper.getMainLooper());
     private boolean probing;
     private int failedChecks;
+    private int startFailures;
     private final Runnable healthCheck = new Runnable() {
         @Override public void run() {
             if (stopping) return;
@@ -63,6 +66,7 @@ public class LocalApiService extends Service {
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, getPackageName() + ":local-api");
         wakeLock.acquire();
+        wakeLockActive = true;
         monitor.postDelayed(healthCheck, 15000);
     }
 
@@ -100,12 +104,16 @@ public class LocalApiService extends Service {
                     origin = state.getString("origin");
                     if (restart || revision == 0) revision++;
                     lastHealthy = System.currentTimeMillis();
+                    startFailures = 0;
                     getSystemService(NotificationManager.class).notify(1, notification(origin + "/v1 · 服务运行中"));
                 }
             } catch (Exception e) {
                 if (!stopping && generation.get() == instanceGeneration) {
                     error = "启动失败：" + e.getMessage();
-                    stopSelf();
+                    origin = null; token = null;
+                    final long delay = Math.min(60000L, 5000L << Math.min(startFailures++, 3));
+                    getSystemService(NotificationManager.class).notify(1, notification("服务暂不可用，正在等待自动恢复"));
+                    monitor.postDelayed(() -> { if (!stopping) launch(true); }, delay);
                 }
             } finally {
                 if (generation.get() == instanceGeneration) starting = false;
@@ -119,6 +127,7 @@ public class LocalApiService extends Service {
         monitor.removeCallbacksAndMessages(null);
         if (generation.get() == instanceGeneration) {
             registered = false; starting = false; lastHealthy = 0;
+            wakeLockActive = false;
             origin = null; token = null;
         }
         new Thread(() -> {
