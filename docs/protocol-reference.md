@@ -36,6 +36,33 @@ python scripts/export_credential_key.py --output .workbuddy/credential-key.json
 
 缺少配置时，加密导出明确返回错误，不会降级输出明文。原 API 默认 `format=backup` 保持兼容，界面显式请求 `format=client`。官方客户端升级改变密钥后，需要从目标版本重新生成配置；不同版本的密钥未必兼容。
 
+## DeepSeek 服务异常补偿接口（2026-10）
+
+官方权益页 `https://www.workbuddy.cn/profile/plans-usage?action=addon` 的公开页面资源定义以下接口，已用授权账号核对状态及一次真实领取：
+
+| 用途 | 方法与地址 | JSON 请求体 |
+| --- | --- | --- |
+| 查询资格与领取状态 | `POST https://www.workbuddy.cn/billing/meter/compensation-status` | `{}` |
+| 领取补偿 | `POST https://www.workbuddy.cn/billing/meter/claim-compensation` | `{}` |
+
+使用账号会话的 Bearer 认证，并设置官方页面的 Origin/Referer。状态响应 `code=0` 时读取 `data.active`、`claimed`、`credit_num`、`end_time`、`validity_period`。本期实测积分为 500，领取截止 `2026-10-22 23:59:59`（北京时间）；`validity_period` 只保留原值，不猜测单位。领取成功为 HTTP 200、`code=0`，`data` 可为空；不需要手机号、积分数量或活动 ID 等业务参数。
+
+本项目仅在本期未截止、`active=true`、`claimed=false` 且 `credit_num=500` 时提交领取。按活动与账号 UID 持久化状态，并用数据库 CAS 租约协调手动、批量和自动操作。请求超时后核对官方状态，十分钟内不重复提交未确认的领取；成功状态先落库，再刷新余额与到期快照。缓存只保存活动字段，不记录认证头和原始响应。
+
+管理接口均要求后台认证：
+
+| 接口 | 用途 / 参数 |
+| --- | --- |
+| `GET /api/benefits/compensation` | 本地状态汇总与自动领取配置 |
+| `PUT /api/benefits/compensation/automatic` | `{"enabled":true}` 或 `false` |
+| `POST /api/benefits/compensation/batch` | `{"confirm":true}`，全部启用账号；可选 `ids` 限定范围，空数组不代表全选 |
+| `POST /api/benefits/compensation/accounts/{id}/refresh` | 仅查询状态 |
+| `POST /api/benefits/compensation/accounts/{id}/claim` | `{"confirm":true}`，领取单账号权益 |
+| `POST /api/accounts/refresh-batch` | 一次提交全部账号余额及到期快照刷新 |
+| `GET /api/growth/job/{job_id}` | 通用后台任务进度与完成汇总 |
+
+批量提交立即返回任务 ID，同类型任务运行中会复用。前端禁用批量按钮并显示执行状态，弹窗可关闭后重新查看，完成后展示成功/失败及积分汇总。通用任务执行器在锁内检查同类型在途任务，防止并发提交重复启动线程。
+
 ## 历史分析与详细报告
 
 下面保留原有章节、复盘和引用，供核对具体协议字段与实现背景。文中的旧部署流程和旧界面说明请结合当前首页使用。

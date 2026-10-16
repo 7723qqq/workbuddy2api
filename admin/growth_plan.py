@@ -39,19 +39,20 @@ def _write(db, key, value):
 
 class _Lease:
     """数据库 CAS 锁，覆盖手动执行、定时执行和多个 uvicorn worker。"""
-    def __init__(self, db):
+    def __init__(self, db, key=_LEASE_KEY):
         self.db = db
+        self.key = key
         self.value = ""
 
     def acquire(self):
-        row = self.db.get(SystemSetting, _LEASE_KEY)
+        row = self.db.get(SystemSetting, self.key)
         if row is None:
-            self.db.add(SystemSetting(key=_LEASE_KEY, value="{}"))
+            self.db.add(SystemSetting(key=self.key, value="{}"))
             try:
                 self.db.commit()
             except IntegrityError:
                 self.db.rollback()
-            row = self.db.get(SystemSetting, _LEASE_KEY)
+            row = self.db.get(SystemSetting, self.key)
         self.db.refresh(row)
         try:
             expiry = json.loads(row.value).get("expires", 0)
@@ -62,7 +63,7 @@ class _Lease:
         previous = row.value
         self.value = json.dumps({"owner": uuid.uuid4().hex, "expires": time.time() + 600})
         changed = (self.db.query(SystemSetting)
-                   .filter(SystemSetting.key == _LEASE_KEY, SystemSetting.value == previous)
+                   .filter(SystemSetting.key == self.key, SystemSetting.value == previous)
                    .update({SystemSetting.value: self.value}, synchronize_session=False))
         self.db.commit()
         return bool(changed)
@@ -73,7 +74,7 @@ class _Lease:
         value["expires"] = time.time() + 600
         self.value = json.dumps(value)
         changed = (self.db.query(SystemSetting)
-                   .filter(SystemSetting.key == _LEASE_KEY, SystemSetting.value == previous)
+                   .filter(SystemSetting.key == self.key, SystemSetting.value == previous)
                    .update({SystemSetting.value: self.value}, synchronize_session=False))
         self.db.commit()
         if not changed:
@@ -81,7 +82,7 @@ class _Lease:
 
     def release(self):
         (self.db.query(SystemSetting)
-         .filter(SystemSetting.key == _LEASE_KEY, SystemSetting.value == self.value)
+         .filter(SystemSetting.key == self.key, SystemSetting.value == self.value)
          .update({SystemSetting.value: "{}"}, synchronize_session=False))
         self.db.commit()
 

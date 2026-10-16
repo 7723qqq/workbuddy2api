@@ -172,6 +172,9 @@ class JobRunner:
         job = Job(key, total, title=title)
         with self._lock:
             self._purge_locked()
+            running = self._jobs.get(key)
+            if running and running.status == 'running':
+                return running
             self._jobs[key] = job
 
         def _run() -> None:

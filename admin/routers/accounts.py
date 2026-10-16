@@ -962,6 +962,76 @@ def inject_to_client(acc_id: int, body: InjectIn, _: bool = Depends(require_admi
     return {"ok": True, "target": target, "backup": backup, "account": acc.name, "uid": acc.uid}
 
 
+def _run_refresh_batch(ids, job):
+    from admin import maintenance
+    from admin.growth_center import identity
+    from admin.growth_plan import _Lease
+    from admin.scheduler import _account_label
+    detail, seen = [], set()
+    with SessionLocal() as db:
+        job.set_phase('刷新账号余额与到期快照')
+        for account_id in ids:
+            account = db.get(Account, account_id)
+            item = {'account_id':account_id, 'account':_account_label(account) if account else str(account_id),
+                    'ok':False, 'status':'error', 'reason':'账号不存在'}
+            job.beat(item['account'])
+            if account:
+                uid = identity(account)
+                with maintenance.account_slot(account, db) as blocked:
+                    lease = _Lease(db, 'account_refresh:' + uid + ':lease')
+                    if blocked or uid in seen:
+                        item.update(status='skipped', reason='账号停用、占用、受保护或本轮重复，已跳过')
+                    elif not lease.acquire():
+                        item.update(status='skipped', reason='账号正在刷新，已跳过重复执行')
+                    else:
+                        seen.add(uid)
+                        original = account.auth_json
+                        try:
+                            with backend.AccountSession(original) as session:
+                                try:
+                                    balance = session.fetch_balance()
+                                    account.balance_total = int(balance.get('total') or 0)
+                                    account.balance_remain = int(balance.get('remain') or 0)
+                                    account.last_sync_at = datetime.utcnow()
+                                    summary = _sync_credit_snapshot(account, session.fetch_credit_details())
+                                    complete = (summary.get('collection') or {}).get('complete', True)
+                                    item.update(ok=complete is True, status='refreshed' if complete else 'error',
+                                                reason='余额与到期快照已刷新' if complete else '余额已刷新，账单来源不完整，保留旧到期快照')
+                                finally:
+                                    db.query(Account).filter(Account.id == account_id, Account.auth_json == original).update(
+                                        {Account.auth_json:session.updated_json()}, synchronize_session=False)
+                                    db.commit()
+                        except Exception:
+                            db.rollback()
+                            item.update(reason='刷新失败，请稍后重试；原有快照保留')
+                        finally:
+                            try:
+                                lease.release()
+                            except Exception:
+                                db.rollback()
+            detail.append(item)
+            job.add_item(item)
+    refreshed = sum(item['status'] == 'refreshed' for item in detail)
+    failed = sum(item['status'] == 'error' for item in detail)
+    skipped = sum(item['status'] == 'skipped' for item in detail)
+    return {'ok':failed == 0, 'total':len(detail), 'refreshed':refreshed, 'failed':failed,
+            'skipped':skipped, 'detail':detail,
+            'summary':f'刷新完成：共 {len(detail)} 个账号，成功 {refreshed} 个，失败 {failed} 个，跳过 {skipped} 个'}
+
+
+@router.post('/refresh-batch')
+def refresh_batch(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    key = 'account-refresh'
+    running = jobrunner.RUNNER.get(key)
+    if running and running.status == 'running':
+        return {'reused':True, **running.snapshot()}
+    ids = [account.id for account in db.query(Account).order_by(Account.id).all()]
+    if not ids:
+        raise HTTPException(400, '没有可刷新的账号')
+    job = jobrunner.RUNNER.start(key, len(ids), lambda job:_run_refresh_batch(ids, job), title='刷新全部账号')
+    return job.snapshot()
+
+
 @router.post("/{acc_id}/refresh")
 def refresh_account(acc_id: int, with_expiry: bool = True,
                     _: bool = Depends(require_admin), db: Session = Depends(get_db)):

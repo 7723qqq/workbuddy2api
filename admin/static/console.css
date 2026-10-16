@@ -175,6 +175,15 @@ button:focus-visible, summary:focus-visible { outline:2px solid var(--brand-ink)
 .model-health-cell { min-width:240px; font-size:12px; font-variant-numeric:tabular-nums; }
 .model-health-cell small { display:block; margin-top:3px; color:var(--fg-muted); font-size:11px; }
 .billing-state { display:block; margin-top:4px; font-size:11px; color:var(--fg-muted); cursor:help; }
+.benefit-muted { color:var(--fg-muted); font-size:12px; line-height:1.6; }
+.benefit-settings, .benefit-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin:16px 0; }
+.benefit-settings label { display:flex; align-items:center; gap:7px; font-size:13px; }
+.benefit-toolbar a { color:var(--brand-ink); font-size:12px; }
+.benefit-summary { display:flex; flex-wrap:wrap; gap:16px; margin:16px 0; padding:16px; border:1px solid var(--border); border-radius:8px; font-size:13px; }
+#compensationPanel input[type=checkbox] { accent-color:var(--brand); }
+#compensationPanel button:disabled { opacity:.5; cursor:not-allowed; }
+[data-account-batch]:disabled { opacity:.55; cursor:wait; }
+#accountJobStatus[hidden] { display:none; }
 @media (prefers-reduced-motion:reduce) {
   *, *::before, *::after { animation:none !important; transition:none !important; }
 }
