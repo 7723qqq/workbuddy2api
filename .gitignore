@@ -108,3 +108,4 @@ workbuddy_admin.db-wal
 docs/*
 !docs/2api-increment-risk-scheduling.md
 !docs/protocol-reference.md
+!docs/RELEASE_NOTES_*.md

@@ -1,4 +1,4 @@
-# WorkBuddy2API 1.0.2
+# WorkBuddy2API 1.0.2 更新公告
 
 本次更新重点加固 2api 反代的账号池调度、模型权限与冷却监测。
 

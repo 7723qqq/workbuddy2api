@@ -62,6 +62,8 @@ Android 覆盖升级必须使用同一个签名。请安全备份 `build/android
 
 公告直接写 Markdown，支持标题、粗体、列表、任务列表、链接、表格、引用和代码块。旧公告把全文包在 `markdown`/`md` 代码块里时也会正确解析；正文里的正常代码块保留。解析器随包内置，无需 CDN，过滤可执行 HTML 和危险链接。
 
+仓库中的版本公告统一保存在 `docs/RELEASE_NOTES_版本号.md`，发布时可复制 [1.0.3 更新公告](docs/RELEASE_NOTES_1.0.3.md) 的内容作为 Release 正文。
+
 示例公告（复制内容即可，不需要在公告外再加代码块）：
 
 ```markdown
