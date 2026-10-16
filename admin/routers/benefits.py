@@ -2,7 +2,7 @@
 import threading
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, validator
 from sqlalchemy.orm import Session
 
 from admin import compensation, jobrunner
@@ -20,7 +20,14 @@ class ClaimIn(BaseModel):
 
 
 class BatchIn(ClaimIn):
-    ids: list[int] | None = Field(default=None, max_length=5000)
+    ids: list[int] | None = None
+
+    @validator('ids')
+    def limit_ids(cls, value):
+        # Android uses Pydantic 1, where max_length is invalid for lists.
+        if value is not None and len(value) > 5000:
+            raise ValueError('一次最多处理 5000 个账号')
+        return value
 
 
 @router.get('/compensation')

@@ -54,6 +54,8 @@ dist/build-1.0.4.json
 
 完整日志位于 `build/package-logs/`。只有两端构建成功且 SHA256 校验通过，才生成成功清单 `build-版本号.json`。构建失败会返回非零退出码，保留日志；版本已修改后失败，可以用 `--non-interactive` 重试。
 
+打包前会在临时空数据库上检查应用启动及批量接口参数校验，不读取本机账号。Windows 使用当前打包依赖；Android 自动在 `build/android-runtime-check/` 创建独立 Python 环境，安装 `android/requirements.txt` 的固定版本后验证暂存源码。首次检查需要下载对应的主机依赖，后续复用环境；此检查验证 Python 服务兼容性，不替代安卓设备测试。
+
 Android 覆盖升级必须使用同一个签名。请安全备份 `build/android-signing/release.jks` 和 `signing.json`，迁移构建机时恢复它们；不要上传到 Git 或 Releases。一键脚本沿用已有签名，不会每次生成新签名。
 
 在 [本项目 Releases](https://github.com/xiaofan6ya/workbuddy2api/releases) 创建正式版本，Tag 用 `1.0.4` 或 `v1.0.4`，上传上述 **两个安装包和两个 `.sha256` 文件**，保留生成的文件名。不要发布成 Draft/Prerelease，否则稳定版更新检查会忽略它。GitHub 提供有效 SHA256 digest 时也支持直接校验，但建议同时上传校验文件。

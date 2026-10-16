@@ -85,6 +85,7 @@ desktop/assets/*.png
 
 !scripts/build_desktop.py
 !scripts/build_android.py
+!scripts/check_runtime.py
 !scripts/export_credential_key.py
 !scripts/asar_grep.py
 !scripts/asar_slice.py

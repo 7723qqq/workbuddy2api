@@ -10,10 +10,25 @@ import secrets
 import shutil
 import subprocess
 import sys
+import venv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 STAGING = ROOT / "android/app/build/generated/python"
+
+
+def check_runtime() -> None:
+    # Run the staged app against Android's pinned dependency versions. Gradle
+    # compilation alone cannot catch import-time FastAPI/Pydantic errors.
+    environment = ROOT / 'build/android-runtime-check'
+    python = environment / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if not python.is_file():
+        venv.EnvBuilder(with_pip=True).create(environment)
+    subprocess.run([str(python), '-m', 'pip', 'install', '--disable-pip-version-check',
+                    '-r', str(ROOT / 'android/requirements.txt'), '--index-url',
+                    'https://pypi.tuna.tsinghua.edu.cn/simple'], check=True)
+    subprocess.run([str(python), str(ROOT / 'scripts/check_runtime.py'), '--android',
+                    '--source-dir', str(STAGING)], cwd=ROOT, check=True)
 
 
 def mobile_html(html: str) -> str:
@@ -89,6 +104,7 @@ def main() -> None:
     prepare()
     if args.prepare_only:
         return
+    check_runtime()
     env = dict(os.environ, WB_ANDROID_BUILD_PYTHON=sys.executable)
     if args.jdk:
         env["JAVA_HOME"] = str(Path(args.jdk).resolve())
