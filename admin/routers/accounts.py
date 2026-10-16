@@ -236,6 +236,17 @@ def _apply_meta(acc: Account, auth_json: str, profile: dict | None = None,
     """
     meta = backend.parse_auth_meta(auth_json)
     prof = profile or {}
+    # 换了新凭据 → 旧的「登录态已失效」结论必须作废。
+    # 这个标记是**自锁**的判据：保活探测、批量刷新、选号都先按它把账号排除，
+    # 被排除的账号再也没机会自证清白，标记也就永远清不掉（实测：重新登录
+    # 导入后仍一直显示「登录态已失效，已跳过」）。凭据没变时才保留结论，
+    # 避免把同一个坏凭据反复解封、反复失败。
+    if auth_json and auth_json != acc.auth_json:
+        acc.last_err_msg = ""
+        acc.last_err_at = None
+        acc.session_dead_fails = 0
+        if (acc.cool_kind or "") == "session_dead":
+            acc.cool_kind = ""
     acc.auth_json = auth_json
     uid = str(prof.get("uid") or meta.get("uid") or "")
     if uid:
