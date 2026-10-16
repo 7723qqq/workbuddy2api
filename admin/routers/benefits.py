@@ -23,30 +23,13 @@ class BatchIn(ClaimIn):
     ids: list[int] | None = Field(default=None, max_length=5000)
 
 
-class AutomaticIn(BaseModel):
-    enabled: bool
-
-
 @router.get('/compensation')
 def overview(db: Session = Depends(get_db)):
     from admin.scheduler import _account_label
-    schedule = compensation.ensure_schedule(db)
     accounts = db.query(Account).order_by(Account.id).all()
     return {'campaign': compensation.campaign(),
-            'automatic': {'id': schedule.id, 'enabled': bool(schedule.enabled),
-                          'interval_minutes': schedule.interval_minutes},
             'items': [{'id': account.id, 'name': _account_label(account), 'enabled': account.status == 'active',
                        **compensation.cached(db, account)} for account in accounts]}
-
-
-@router.put('/compensation/automatic')
-def automatic(body: AutomaticIn, db: Session = Depends(get_db)):
-    if body.enabled and compensation.campaign()['expired']:
-        raise HTTPException(400, '补偿活动已截止，不能开启领取')
-    schedule = compensation.ensure_schedule(db)
-    schedule.enabled = int(body.enabled)
-    db.commit()
-    return {'enabled': bool(schedule.enabled)}
 
 
 def _account(db, account_id):

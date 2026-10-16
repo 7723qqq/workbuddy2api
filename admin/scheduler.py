@@ -193,8 +193,8 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         return res
     if task == "daily_checkin":
         return run_daily_checkin(db, schedule)
-    if task == "claim_compensation":
-        from admin.compensation import run_scheduled
+    if task == "claim_benefits":
+        from admin.benefits import run_scheduled
         return run_scheduled(db, schedule)
     if task == "refresh_growth_tasks":
         return run_refresh_growth_tasks()
@@ -1077,7 +1077,7 @@ def start_scheduler():
         ensure_keepalive_schedule(db)
         ensure_credit_schedule(db)
         ensure_growth_plan_schedule(db)
-        from admin.compensation import ensure_schedule
+        from admin.benefits import ensure_schedule
         ensure_schedule(db)
         from admin.growth_center import import_last_run
         import_last_run(db)

@@ -825,7 +825,6 @@
             <div class="action-menu-panel">
               <div class="action-menu-label">额度与批量管理</div>
               <button type="button" data-account-batch onclick="closeAccountMenu(); WBBenefits.claimAll()"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M5 12v9h14v-9M12 8v13"/></svg>一键领取 DeepSeek 补偿 · 500 积分</button>
-              <button type="button" onclick="closeAccountMenu(); WBBenefits.open()">补偿自动领取设置与概览</button>
               <button type="button" onclick="closeAccountMenu(); openModelLimits()"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9l6 3"/><circle cx="12" cy="12" r="9"/></svg>模型额度与冷却</button>
               <button type="button" data-account-batch onclick="closeAccountMenu(); accountBatchAction(growthRunBatch)"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5H5v16h14V5h-4"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="m8 13 3 3 5-6"/></svg>成长任务与领奖</button>
               <button type="button" data-account-batch onclick="closeAccountMenu(); accountBatchAction(catTravelBatch)"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 9 18-6-6 18-4-8-8-4Zm8 4 10-10"/></svg>猫猫旅行与领奖</button>
@@ -4989,7 +4988,7 @@ const _scheduleRequests = new Set();
 // 任务类型 -> 人话名称。结果里有 summary 就用它，这样每个任务都统一可读。
 // keepalive_tokens 是既有任务（保活）但两张表都漏了它，显得像"未知任务"。
 const TASK_LABELS = {
-  claim_compensation: "DeepSeek 补偿权益领取",
+  claim_benefits: "每日检查并领取权益",
   daily_checkin: "每日签到领取积分",
   refresh_balances: "刷新平台总积分",
   refresh_credits: "更新积分到期快照",

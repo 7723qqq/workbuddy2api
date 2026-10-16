@@ -1,12 +1,13 @@
 """Time-limited DeepSeek compensation with persisted claims and shared leases."""
 from datetime import datetime, timedelta, timezone
+import hashlib
 import time
 
 from admin import maintenance
 from admin.backend import AccountSession
 from admin.growth_center import identity, record_result
 from admin.growth_plan import _Lease, _read, _write
-from admin.models import Account, Schedule
+from admin.models import Account
 
 CAMPAIGN = 'deepseek-202610'
 TITLE = 'DeepSeek 模型服务异常额外补偿'
@@ -27,34 +28,56 @@ def _now():
     return datetime.now(DAY_TZ)
 
 
-def _key(account):
+def _key(account, offer=None):
+    if offer:
+        deadline = _deadline(offer.get('end_time'), limited=False)
+        amount = offer.get('credit_num')
+        if deadline != END or amount != CREDIT:
+            signature = f'{deadline.isoformat() if deadline else "unknown"}:{amount}'
+            campaign_id = hashlib.sha256(signature.encode()).hexdigest()[:24]
+            return 'benefits:meter:' + campaign_id + ':' + identity(account)
     return 'compensation:' + CAMPAIGN + ':' + identity(account)
 
 
-def cached(db, account):
-    state = _read(db, _key(account))
+def cached(db, account, *, key=None, limited=True):
+    state = _read(db, key or _key(account))
     if state.get('claimed'):
-        return {**state, 'status': 'already', 'reason': '该账号已领取补偿', 'credit': 0, 'ok': True}
-    if _now() >= END:
+        return {**state, 'status': 'already', 'reason': '本期权益已领取', 'credit': 0, 'ok': True}
+    if limited and _now() >= END:
         return {**state, 'status': 'expired', 'reason': '已超过领取截止时间', 'credit': 0, 'ok': True}
     return state or {'status': 'unknown', 'reason': '尚未查询', 'credit': 0}
 
 
-def _deadline(value):
+def _deadline(value, *, limited=True):
     if not isinstance(value, str) or not value:
-        return END
+        return END if limited else None
     try:
         parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        return min(END, parsed.replace(tzinfo=DAY_TZ) if parsed.tzinfo is None else parsed)
+        deadline = parsed.replace(tzinfo=DAY_TZ) if parsed.tzinfo is None else parsed.astimezone(DAY_TZ)
+        return min(END, deadline) if limited else deadline
     except ValueError:
-        return END
+        return END if limited else None
 
 
-def _status(result):
+def _status(result, *, discover=False):
     if not result.get('ok'):
         return {'status': 'error', 'ok': False, 'reason': '补偿状态查询失败，请稍后重试'}
     data = result.get('data') or {}
     common = {key: data[key] for key in ('active', 'claimed', 'credit_num', 'validity_period', 'end_time') if key in data}
+    if discover:
+        amount = data.get('credit_num')
+        deadline = _deadline(data.get('end_time'), limited=False)
+        if data.get('active') is False:
+            return {**common, 'status':'ineligible', 'ok':True, 'reason':'当前暂无可领取权益'}
+        if type(amount) is not int or amount <= 0 or deadline is None:
+            return {**common, 'status':'unknown', 'ok':False, 'reason':'权益金额或截止时间不明确，未发起领取'}
+        if data.get('claimed') is True:
+            return {**common, 'status':'already', 'ok':True, 'reason':'本期权益已领取'}
+        if _now() >= deadline:
+            return {**common, 'status':'expired', 'ok':True, 'reason':'本期权益已截止'}
+        if data.get('active') is True and data.get('claimed') is False:
+            return {**common, 'status':'available', 'ok':True, 'reason':f'发现可领取权益 {amount} 积分'}
+        return {**common, 'status':'unknown', 'ok':False, 'reason':'权益状态不明确，未发起领取'}
     if data.get('claimed') is True:
         return {**common, 'status': 'already', 'ok': True, 'reason': '该账号已领取补偿'}
     if _now() >= _deadline(data.get('end_time')):
@@ -82,9 +105,9 @@ def _refresh_resources(account, session, result):
         result['reason'] += '；余额或到期快照尚未完整刷新，下次自动重试'
 
 
-def process_account(db, account, *, claim=True, source='manual'):
+def process_account(db, account, *, claim=True, source='manual', discover=False):
     """Check before claiming; serialize same-UID manual, batch and scheduled work."""
-    previous = cached(db, account)
+    previous = {} if discover else cached(db, account)
     if previous.get('status') == 'expired' or (previous.get('claimed') and previous.get('resources_refreshed')):
         return previous
     with maintenance.account_slot(account, db) as blocked:
@@ -96,14 +119,23 @@ def process_account(db, account, *, claim=True, source='manual'):
         if not lease.acquire():
             return {'status': 'deferred', 'ok': False, 'credit': 0, 'reason': '该账号权益正在处理中，请稍后查看'}
         try:
-            previous = cached(db, account)
+            previous = {} if discover else cached(db, account)
             if previous.get('status') == 'expired' or (previous.get('claimed') and previous.get('resources_refreshed')):
                 return previous
             original = account.auth_json
             with AccountSession(original) as session:
                 try:
                     # A failed resource refresh retries reads only, even after expiry.
-                    result = dict(previous) if previous.get('claimed') else _status(session.compensation_status())
+                    result = dict(previous) if previous.get('claimed') else _status(session.compensation_status(), discover=discover)
+                    if discover:
+                        # Always probe upstream first: yesterday's claimed offer may
+                        # have been replaced by a new reward, amount or deadline.
+                        key = _key(account, result)
+                        previous = cached(db, account, key=key, limited=False)
+                        if previous.get('claimed'):
+                            result = dict(previous)
+                            if previous.get('resources_refreshed'):
+                                return result
                     result['credit'] = 0
                     result['checked_at'] = _now().isoformat(timespec='seconds')
                     # Preserve unknown attempts across refreshes/restarts. A successful
@@ -112,7 +144,8 @@ def process_account(db, account, *, claim=True, source='manual'):
                     if attempted:
                         result['attempt_at'] = attempted
                     if claim and result['status'] == 'available':
-                        if _now() >= _deadline(result.get('end_time')):
+                        amount = result['credit_num'] if discover else CREDIT
+                        if _now() >= _deadline(result.get('end_time'), limited=not discover):
                             result.update(status='expired', ok=True, reason='补偿活动已截止')
                         elif attempted and time.time() - attempted < RECHECK_SECONDS:
                             result.update(status='pending', ok=False,
@@ -126,17 +159,17 @@ def process_account(db, account, *, claim=True, source='manual'):
                             except Exception:
                                 response = {'ok': False}
                             if response.get('ok'):
-                                result.update(status='claimed', claimed=True, ok=True, credit=CREDIT,
-                                              reason='已领取 500 积分补偿', claimed_at=_now().isoformat(timespec='seconds'))
+                                result.update(status='claimed', claimed=True, ok=True, credit=amount,
+                                              reason=f'已领取 {amount} 积分权益', claimed_at=_now().isoformat(timespec='seconds'))
                             else:
                                 # Lost responses can follow a successful credit grant.
                                 # Re-read server state before ever attempting another POST.
                                 try:
-                                    checked = _status(session.compensation_status())
+                                    checked = _status(session.compensation_status(), discover=discover)
                                 except Exception:
                                     checked = {}
-                                if checked.get('claimed') is True:
-                                    result.update(status='claimed', claimed=True, ok=True, credit=CREDIT,
+                                if checked.get('claimed') is True and (not discover or _key(account, checked) == key):
+                                    result.update(status='claimed', claimed=True, ok=True, credit=amount,
                                                   reason='已通过官方状态确认领取成功', claimed_at=_now().isoformat(timespec='seconds'))
                                 else:
                                     result['reason'] = '领取未确认，稍后复查官方状态；不会立即重复提交'
@@ -147,7 +180,7 @@ def process_account(db, account, *, claim=True, source='manual'):
                         _refresh_resources(account, session, result)
                     _write(db, key, result)
                     if result['status'] == 'claimed':
-                        record_result(db, account.id, result, source=source, action=TITLE)
+                        record_result(db, account.id, result, source=source, action='权益获取' if discover else TITLE)
                     return result
                 finally:
                     # Do not overwrite a new login completed during the upstream call.
@@ -167,7 +200,7 @@ def process_account(db, account, *, claim=True, source='manual'):
                 db.rollback()  # Lease expires on its own if the database is unavailable.
 
 
-def run_batch(db, ids=None, *, job=None, source='schedule'):
+def run_batch(db, ids=None, *, job=None, source='schedule', discover=False):
     from admin.scheduler import _account_label
     query = db.query(Account).filter(Account.status == 'active')
     if ids is not None:
@@ -184,7 +217,7 @@ def run_batch(db, ids=None, *, job=None, source='schedule'):
             result = {'ok': True, 'status': 'duplicate', 'credit': 0, 'reason': '同 UID 账号本轮已处理'}
         else:
             seen.add(account_identity)
-            result = process_account(db, account, source=source)
+            result = process_account(db, account, source=source, discover=discover)
         item = {**result, 'account_id': account_id, 'account': label}
         detail.append(item)
         if job:
@@ -195,30 +228,6 @@ def run_batch(db, ids=None, *, job=None, source='schedule'):
     deferred = sum(item['status'] in ('deferred', 'pending') for item in detail)
     failed = sum(item['status'] in ('error', 'unknown') for item in detail)
     skipped = sum(item['status'] in ('ineligible', 'expired', 'duplicate') for item in detail)
-    return {'task': TASK, 'ok': failed == 0, 'total': len(detail), 'claimed': claimed,
+    return {'task': 'claim_benefits' if discover else TASK, 'ok': failed == 0, 'total': len(detail), 'claimed': claimed,
             'already': already, 'credit': credit, 'deferred': deferred, 'failed': failed, 'skipped': skipped,
             'detail': detail, 'summary': f'共 {len(detail)} 个账号：领取成功 {claimed} 个，失败 {failed} 个，共计领取 {credit} 积分；已领取 {already} 个，顺延/待确认 {deferred} 个，其他跳过 {skipped} 个'}
-
-
-def ensure_schedule(db):
-    schedule = db.query(Schedule).filter(Schedule.task == TASK).order_by(Schedule.id).first()
-    if schedule is None:
-        schedule = Schedule(name='DeepSeek 补偿 500 积分自动领取', task=TASK,
-                            interval_minutes=60, enabled=int(_now() < END),
-                            next_run_at=datetime.utcnow() + timedelta(seconds=45),
-                            stop_after=END.astimezone(timezone.utc).replace(tzinfo=None))
-        db.add(schedule)
-        db.commit()
-    if _now() >= END and schedule.enabled:
-        schedule.enabled = 0
-        db.commit()
-    return schedule
-
-
-def run_scheduled(db, schedule):
-    if _now() >= END or (schedule and schedule.stop_after and datetime.utcnow() >= schedule.stop_after):
-        if schedule:
-            schedule.enabled = 0
-            db.commit()
-        return {'task': TASK, 'ok': True, 'summary': '补偿活动已截止，自动领取已停止', 'total': 0}
-    return run_batch(db)

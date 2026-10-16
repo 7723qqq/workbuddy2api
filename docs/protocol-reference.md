@@ -47,14 +47,15 @@ python scripts/export_credential_key.py --output .workbuddy/credential-key.json
 
 使用账号会话的 Bearer 认证，并设置官方页面的 Origin/Referer。状态响应 `code=0` 时读取 `data.active`、`claimed`、`credit_num`、`end_time`、`validity_period`。本期实测积分为 500，领取截止 `2026-10-22 23:59:59`（北京时间）；`validity_period` 只保留原值，不猜测单位。领取成功为 HTTP 200、`code=0`，`data` 可为空；不需要手机号、积分数量或活动 ID 等业务参数。
 
-本项目仅在本期未截止、`active=true`、`claimed=false` 且 `credit_num=500` 时提交领取。按活动与账号 UID 持久化状态，并用数据库 CAS 租约协调手动、批量和自动操作。请求超时后核对官方状态，十分钟内不重复提交未确认的领取；成功状态先落库，再刷新余额与到期快照。缓存只保存活动字段，不记录认证头和原始响应。
+DeepSeek 手动入口仅在本期未截止、`active=true`、`claimed=false` 且 `credit_num=500` 时提交领取。通用定时任务 `claim_benefits` 默认每 1440 分钟查询一次该官方状态接口，使用返回的实际积分及截止时间识别当前权益，可识别后续通过同一接口提供的新活动。本期截止不会停用每日任务；新类型福利使用其他接口时仍需单独接入。
+
+每日检查先查询上游状态，再按规范化的截止时间、积分与账号 UID 确定活动缓存；本期 500 积分补偿与手动入口共用记录及数据库 CAS 租约。请求超时后核对同一期官方状态，十分钟内不重复提交未确认的领取；成功状态先落库，再刷新余额与到期快照。缓存只保存活动字段，不记录认证头和原始响应。旧 `claim_compensation` 任务升级为每日权益任务，清除本期截止设置并保留原启停状态。
 
 管理接口均要求后台认证：
 
 | 接口 | 用途 / 参数 |
 | --- | --- |
-| `GET /api/benefits/compensation` | 本地状态汇总与自动领取配置 |
-| `PUT /api/benefits/compensation/automatic` | `{"enabled":true}` 或 `false` |
+| `GET /api/benefits/compensation` | 本期补偿的本地状态汇总，不创建定时任务 |
 | `POST /api/benefits/compensation/batch` | `{"confirm":true}`，全部启用账号；可选 `ids` 限定范围，空数组不代表全选 |
 | `POST /api/benefits/compensation/accounts/{id}/refresh` | 仅查询状态 |
 | `POST /api/benefits/compensation/accounts/{id}/claim` | `{"confirm":true}`，领取单账号权益 |
