@@ -47,7 +47,7 @@ router = APIRouter(prefix="/api/login", tags=["login"])
 #: 自助注册用的公开路由（不需要后台登录态、也不需要邀请码）。
 public_router = APIRouter(tags=["join"])
 
-#: 同一**手机号**两次发码的最小间隔（秒）。防对同一个号短信轰炸。
+#: 同一出口 IP、同一手机号两次发码的最小间隔（秒）。
 SMS_MIN_INTERVAL = 60
 #: 同一 IP 每小时最多发码次数（防有人拿我们的出口 IP 刷短信）。
 SMS_MAX_PER_HOUR = 10
@@ -56,31 +56,43 @@ SMS_MAX_PER_HOUR = 10
 #:   ip -> [时间戳...]        按小时封顶
 #:   mobile -> 上次发码时间戳  按号码 60s 间隔
 #:
-#: 为什么间隔要绑**手机号**而不是 IP：朋友之间经常共用出口（公司/校园 NAT、
-#: 家庭 Wi-Fi、手机运营商 CGNAT）。若按 IP 做 60s 间隔，第二个人会被第一个
-#: 人挡掉 —— 而他们要登录的其实是不同的号。按号码限间隔既能挡住对同号的轰炸，
-#: 又不会误伤共用网络的多人。IP 维度只留一个宽松的小时上限兜底。
+# The upstream observes our shared egress IP, including failed requests.
 _sms_log: dict[str, list[float]] = {}
 _sms_mobile_last: dict[str, float] = {}
 #: FastAPI 的同步端点跑在线程池里，节流表会被并发读写 —— 必须加锁。
 _sms_lock = threading.Lock()
+_sms_exit_last = 0.0
+_sms_exit_blocked_until = 0.0
+_sms_exit_hits: list[float] = []
 
 
 def _check_sms_quota(ip: str, mobile: str = "") -> None:
     """发码节流。超限直接 429。
 
     * `mobile` 非空时按号码限 60 秒间隔；
-    * 任意情况下按 IP 限每小时 `SMS_MAX_PER_HOUR` 次。
+    * 所有客户端共用出口的最小间隔和每小时上限，失败请求也占配额；
+    * 任意情况下按客户端 IP 限每小时 `SMS_MAX_PER_HOUR` 次。
     """
+    global _sms_exit_last
     now = time.time()
     with _sms_lock:
+        _sms_exit_hits[:] = [stamp for stamp in _sms_exit_hits if now - stamp < 3600]
+        if len(_sms_exit_hits) >= SMS_MAX_PER_HOUR:
+            wait = max(1, int(3600 - (now - _sms_exit_hits[0])) + 1)
+            raise HTTPException(429, "短信出口本小时配额已用完，请稍后重试", headers={"Retry-After": str(wait)})
+        wait = max(_sms_exit_last + SMS_MIN_INTERVAL, _sms_exit_blocked_until) - now
+        if wait > 0:
+            seconds = int(wait) + 1
+            raise HTTPException(429, detail=f"短信出口保护中，请 {seconds} 秒后再试",
+                                headers={"Retry-After": str(seconds)})
         if mobile:
             last = _sms_mobile_last.get(mobile, 0.0)
             if last and (now - last) < SMS_MIN_INTERVAL:
                 wait = int(SMS_MIN_INTERVAL - (now - last)) + 1
                 raise HTTPException(
                     status_code=429,
-                    detail=f"该手机号发送过于频繁，请 {wait} 秒后再试")
+                    detail=f"该手机号发送过于频繁，请 {wait} 秒后再试",
+                    headers={"Retry-After": str(wait)})
 
         hits = [t for t in _sms_log.get(ip, []) if now - t < 3600]
         if len(hits) >= SMS_MAX_PER_HOUR:
@@ -90,17 +102,14 @@ def _check_sms_quota(ip: str, mobile: str = "") -> None:
         _sms_log[ip] = hits
         if mobile:
             _sms_mobile_last[mobile] = now
-
-
-def _refund_sms_quota(ip: str, mobile: str = "") -> None:
-    """发码失败时归还配额 —— 否则用户手滑几次就被自己锁死。"""
-    with _sms_lock:
-        hits = _sms_log.get(ip) or []
-        if hits:
-            hits.pop()
-            _sms_log[ip] = hits
-        if mobile:
-            _sms_mobile_last.pop(mobile, None)
+        _sms_exit_last = now
+        _sms_exit_hits.append(now)
+        for key in list(_sms_log):
+            if not any(now - stamp < 3600 for stamp in _sms_log[key]):
+                del _sms_log[key]
+        for key, stamp in list(_sms_mobile_last.items()):
+            if now - stamp > 3600:
+                del _sms_mobile_last[key]
 
 
 class StartOut(BaseModel):
@@ -111,6 +120,7 @@ class StartOut(BaseModel):
 class SendIn(BaseModel):
     sid: str
     mobile: str
+    country_code: str = "86"
 
 
 class VerifyIn(BaseModel):
@@ -339,15 +349,37 @@ def login_send(body: SendIn, request: Request, _: bool = Depends(require_admin))
     """第 2 步：给指定手机号发验证码。"""
     ip = get_client_ip(request.headers.get("x-forwarded-for"), request.client.host
                        if request.client else None)
-    mobile = wb_login.normalize_mobile(body.mobile)
-    _check_sms_quota(ip, mobile)
+    return _send_guarded(body, ip)
+
+
+def _send_guarded(body, ip):
+    global _sms_exit_blocked_until
     try:
+        mobile = wb_login.normalize_mobile(body.mobile, body.country_code)
         sess = wb_login.get_session(body.sid)
-        out = wb_login.send_sms(sess, body.mobile)
-    except wb_login.WbLoginError as e:
-        _refund_sms_quota(ip, mobile)
-        raise _fail(e, 502)
-    return {"ok": True, "expires_in": out.get("expires_in", 60)}
+        with _upstream_slot("send"), sess.lock:
+            if sess.consumed or sess.expired():
+                raise wb_login.WbLoginError("会话已失效", step="session")
+            if sess.sms_state_token and (sess.mobile != mobile or sess.country_code != body.country_code.lstrip("+")):
+                raise wb_login.WbLoginError("请先完成当前手机号的验证码验证", step="mobile")
+            _check_sms_quota(ip, body.country_code + ":" + mobile)
+            # An upstream failure or timeout may still have sent an SMS. Keep the quota.
+            try:
+                out = wb_login.send_sms(sess, mobile, body.country_code)
+            except wb_login.WbLoginError as error:
+                if error.reason == "need_captcha" or any(word in error.message.lower() for word in ("频繁", "限制", "rate", "频率")):
+                    with _sms_lock:
+                        _sms_exit_blocked_until = time.time() + 300
+                raise
+    except wb_login.WbLoginError as error:
+        response = _fail(error, 400 if error.step in ("mobile", "session") else 502)
+        if error.step == "sms_send":
+            response.headers = {"Retry-After": str(max(SMS_MIN_INTERVAL, int(_sms_exit_blocked_until - time.time()) + 1))}
+        raise response
+    except wb_login.httpx.RequestError:
+        raise HTTPException(502, detail={"message": "短信发送结果未知，请稍后再试", "step": "sms_send"},
+                            headers={"Retry-After": str(SMS_MIN_INTERVAL)}) from None
+    return {"ok": True, "expires_in": out.get("expires_in", 60), "retry_after": SMS_MIN_INTERVAL}
 
 
 @router.post("/verify")
@@ -388,9 +420,17 @@ def login_status(sid: str, _: bool = Depends(require_admin)):
     return {
         "alive": True,
         "mobile": sess.mobile,
+        "country_code": sess.country_code,
         "code_sent": bool(sess.sms_state_token),
+        "consumed": sess.consumed,
+        "retry_after": max(0, int(sess.code_sent_at + SMS_MIN_INTERVAL - time.time()) + 1),
         "age": int(time.time() - sess.created),
     }
+
+
+@public_router.get("/api/join/status/{sid}")
+def join_status(sid: str):
+    return login_status(sid, True)
 
 
 # ===========================================================================
@@ -418,6 +458,7 @@ class JoinIn(BaseModel):
     """
     sid: Optional[str] = ""
     mobile: str = ""
+    country_code: str = "86"
     sms_code: str = ""
 
 
@@ -534,6 +575,11 @@ def _run_post_login_automation(account_id: int, name: str) -> dict:
                 bal = sess.fetch_balance()
                 acc.balance_total = int(bal.get("total", 0) or 0)
                 acc.balance_remain = int(bal.get("remain", 0) or 0)
+                from admin.routers.accounts import _sync_credit_snapshot
+                try:
+                    _sync_credit_snapshot(acc, sess.fetch_credit_details())
+                except Exception:
+                    result["errors"].append("积分到期快照刷新失败")
                 acc.auth_json = sess.updated_json()
             acc.last_sync_at = datetime.utcnow()
             db.commit()
@@ -619,20 +665,7 @@ def join_send(body: JoinIn, request: Request):
     """公开：发短信验证码。"""
     ip = get_client_ip(request.headers.get("x-forwarded-for"),
                        request.client.host if request.client else None)
-    mobile = wb_login.normalize_mobile(body.mobile)
-    _check_sms_quota(ip, mobile)
-    try:
-        sess = wb_login.get_session(body.sid)
-        with _upstream_slot("send"):
-            out = wb_login.send_sms(sess, body.mobile)
-    except wb_login.WbLoginError as e:
-        _refund_sms_quota(ip, mobile)
-        raise _fail(e, 502)
-    except HTTPException:
-        # 忙 -> 归还配额（其实没发出去），503 透给前端
-        _refund_sms_quota(ip, mobile)
-        raise
-    return {"ok": True, "expires_in": out.get("expires_in", 60)}
+    return _send_guarded(body, ip)
 
 
 @public_router.post("/api/join/verify")

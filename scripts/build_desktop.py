@@ -22,6 +22,7 @@ def main():
         raise SystemExit("Use Windows x64 with a 64-bit Python interpreter")
     if sys.maxsize <= 2**32:
         raise SystemExit("A 64-bit Python interpreter is required")
+    subprocess.run([sys.executable, str(ROOT / 'scripts/check_runtime.py')], cwd=ROOT, check=True)
     import resvg_py
     from PIL import Image
     version = json.loads((ROOT / "desktop/version.json").read_text(encoding="utf-8"))["version"]

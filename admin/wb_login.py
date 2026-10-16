@@ -295,6 +295,7 @@ class PhoneLoginSession:
     sms_state_token: str = ""
     #: 最近一次发码的手机号（校验时比对，防串号）。
     mobile: str = ""
+    country_code: str = "86"
     code_sent_at: float = 0.0
     #: 一次登录只允许成功一次。
     consumed: bool = False
@@ -633,18 +634,31 @@ def start_login() -> PhoneLoginSession:
 
 
 #: 中国大陆手机号（11 位，1 开头）。登录页只放开 +86，避免把国际号写死错。
-_MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
+MOBILE_PATTERNS = {"86": r"1[3-9][0-9]{9}", "852": r"[4-9][0-9]{7}", "853": r"6[0-9]{7}"}
 
 
-def normalize_mobile(mobile: str) -> str:
-    """归一化手机号：去掉空格/横线/+86 前缀，返回 11 位数字串。"""
-    digits = re.sub(r"\D", "", mobile or "")
-    if digits.startswith("86") and len(digits) == 13:
-        digits = digits[2:]
+def normalize_mobile(mobile: str, country_code: str = "86") -> str:
+    country_code = country_code.lstrip("+").strip()
+    if country_code not in MOBILE_PATTERNS:
+        raise WbLoginError("不支持的地区代码", step="mobile")
+    digits = re.sub(r"[\s()-]", "", mobile or "")
+    if digits.startswith("+" + country_code):
+        digits = digits[len(country_code) + 1:]
+    elif digits.startswith(country_code) and len(digits) == (11 if country_code == "86" else 8) + len(country_code):
+        digits = digits[len(country_code):]
+    if not re.fullmatch(MOBILE_PATTERNS[country_code], digits):
+        raise WbLoginError("请输入所选地区的有效手机号", step="mobile")
     return digits
 
 
-def send_sms(sess: PhoneLoginSession, mobile: str) -> dict:
+def send_sms(sess: PhoneLoginSession, mobile: str, country_code: str = "86") -> dict:
+    with sess.lock:
+        if sess.consumed or sess.expired():
+            raise WbLoginError("会话已失效，请重新登录", step="session")
+        return _send_sms_locked(sess, mobile, country_code)
+
+
+def _send_sms_locked(sess: PhoneLoginSession, mobile: str, country_code: str) -> dict:
     """第 6 步：发短信验证码。
 
     关于 `spi_extra`（风控上下文）：官方网页版每次都会带上它，其 `state` 来自
@@ -656,13 +670,14 @@ def send_sms(sess: PhoneLoginSession, mobile: str) -> dict:
     被请求多次后会要求图形验证码，换成别的号立刻正常（已实测确认是按号而非按 IP）。
     这种情况纯协议无法通过（滑块要跑腾讯的 JS），只能如实告知用户稍后再试。
     """
-    mobile = normalize_mobile(mobile)
-    if not _MOBILE_RE.match(mobile):
-        raise WbLoginError("请输入正确的 11 位手机号", step="mobile")
+    country_code = country_code.lstrip("+").strip()
+    mobile = normalize_mobile(mobile, country_code)
+    if sess.sms_state_token and (sess.mobile != mobile or sess.country_code != country_code):
+        raise WbLoginError("当前会话正在等待验证码，请完成验证后再更换号码", step="mobile")
 
     r = sess.client.post(
         f"{OAUTH2}/v1/auth/sms/code/send",
-        json={"client_code": "codebuddy", "mobile": "+86 " + mobile,
+        json={"client_code": "codebuddy", "mobile": "+" + country_code + " " + mobile,
               "scopes": ["openid", "mobile", "profile"]},
         headers=sess._headers({"Content-Type": "application/json",
                                "X-TOA-LANG": "zh-CN"}))
@@ -688,6 +703,7 @@ def send_sms(sess: PhoneLoginSession, mobile: str) -> dict:
 
     sess.sms_state_token = str(token)
     sess.mobile = mobile
+    sess.country_code = country_code
     sess.code_sent_at = time.time()
     _logger.info("wb_login: 已发验证码 sid=%s mobile=%s***", sess.sid[:8], mobile[:3])
     return {"expires_in": int(obj.get("expires_in") or obj.get("expire") or 60)}

@@ -105,19 +105,17 @@ def anthropic_request_to_chat(body: dict) -> dict:
     # 档位来源优先级：thinking.effort > output_config.effort > 默认 high
     # （实测 high 是 deepseek 系上游的默认档，且必然开启思维链）
     output_config = body.get("output_config")
-    effort_hint = ""
-    if isinstance(output_config, dict):
-        _e = output_config.get("effort")
-        if isinstance(_e, str) and _e.strip():
-            effort_hint = _e.strip()
-
+    effort_hint = output_config.get("effort") if isinstance(output_config, dict) else None
+    effort_hint = effort_hint.strip() if isinstance(effort_hint, str) else ""
     thinking = body.get("thinking")
     if isinstance(thinking, dict):
         ttype = str(thinking.get("type") or "").strip().lower()
         if ttype == "disabled":
             chat["thinking"] = {"type": "disabled"}
         elif ttype in ("enabled", "adaptive"):
-            effort = thinking.get("effort") or effort_hint
+            effort = thinking.get("effort")
+            if not isinstance(effort, str) or not effort.strip():
+                effort = effort_hint
             if not (isinstance(effort, str) and effort.strip()):
                 effort = "high"
             chat.setdefault("reasoning_effort", effort.strip())

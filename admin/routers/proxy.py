@@ -1537,6 +1537,88 @@ def _client_stream(source):
     return source
 
 
+async def _stream_response(source, anthropic=False):
+    """Keep pre-output failures as HTTP errors so SDK retry policies can run."""
+    try:
+        first = await source.__anext__()
+    except StopAsyncIteration:
+        first = ""
+    except BaseException:
+        await source.aclose()
+        raise
+    text = first.decode("utf-8", "replace") if isinstance(first, bytes) else first
+    error = None
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            try:
+                obj = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and obj.get("error"):
+                error = obj["error"]
+                break
+    if error is not None or not first:
+        await source.aclose()
+        error = error if isinstance(error, dict) else {"message": str(error or "上游未返回有效响应")}
+        code = error.get("code")
+        status = code if isinstance(code, int) and 400 <= code <= 599 else 503
+        retryable = status in (429, 502, 503, 504)
+        kind = ("overloaded_error" if retryable else "invalid_request_error") if anthropic else ("server_error" if retryable else "invalid_request_error")
+        payload = {"error": {**error, "type": kind, "code": "service_unavailable" if retryable else code}}
+        if anthropic:
+            payload["type"] = "error"
+        return JSONResponse(status_code=status, content=payload,
+                            headers={"Retry-After": "3"} if retryable else {})
+
+    async def remaining():
+        try:
+            yield first
+            async for chunk in source:
+                yield chunk
+        finally:
+            await source.aclose()
+    return StreamingResponse(_client_stream(remaining()), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+async def _select_account_with_wait(db, **kwargs):
+    deadline = time.monotonic() + 8
+    while True:
+        account = await _blocking_call(_select_account, db, **kwargs)
+        if account is not None or POOL.waf.active() or time.monotonic() >= deadline:
+            return account
+
+        def temporarily_busy():
+            now = datetime.utcnow()
+            query = scope_accounts(db.query(Account), kwargs.get("account_id"), kwargs.get("key_id"))
+            excluded = kwargs.get("exclude_ids")
+            if excluded:
+                query = query.filter(~Account.id.in_(excluded))
+            for row in query.filter(Account.status == "active").all():
+                if not row.balance_remain and not db.query(ModelConfig).filter(
+                        ModelConfig.model_id == kwargs.get("model"), ModelConfig.credit_multiplier == 0).first():
+                    continue
+                if _looks_login_dead(row, now):
+                    continue
+                timers = [getattr(row, field) for field in ("cool_until", "breaker_until", "degrade_until")]
+                limit = db.query(AccountModelCooldown).filter(
+                    AccountModelCooldown.account_id == row.id, AccountModelCooldown.model == kwargs.get("model"),
+                    AccountModelCooldown.until > now).first()
+                if limit:
+                    timers.append(limit.until)
+                if any(timer and (timer - now).total_seconds() > deadline - time.monotonic() for timer in timers):
+                    continue
+                if POOL.inflight.full(row.uid or "", settings.MAX_IN_FLIGHT) or any(timer and timer > now for timer in timers):
+                    return True
+            return False
+        if not await _blocking_call(temporarily_busy):
+            # A lease can be released between selection and this check.
+            await _blocking_call(db.rollback)
+            return await _blocking_call(_select_account, db, **kwargs)
+        await _blocking_call(db.rollback)
+        await asyncio.sleep(min(.5, max(0, deadline - time.monotonic())))
+
+
 async def _request_json(request):
     # A disconnect while uploading is distinct from malformed JSON. Preserve
     # the existing HTTP response while exposing the actual cause in diagnostics.
@@ -2343,7 +2425,7 @@ async def chat_completions(
                             break
                         if not retry_budget.available():
                             break
-                        acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
+                        acc_i = await _select_account_with_wait(db2, exclude_ids=tried_ids, min_balance=1,
                                                 model=m, sticky_key=sticky_key,
                                                 account_id=getattr(key, "account_id", None), key_id=key.id)
                         if not acc_i:
@@ -2642,6 +2724,9 @@ async def chat_completions(
                                             "message": f"上游流中断：{e}",
                                             "type": "upstream_error"}},
                                         ensure_ascii=False)
+                                else:
+                                    yield 'data: ' + json.dumps({"error": {"message": "上游流中断，请重试", "type": "server_error",
+                                                                          "code": "upstream_stream_interrupted"}}, ensure_ascii=False) + '\n\n'
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2666,7 +2751,7 @@ async def chat_completions(
                           reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
             err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n)
-            err_obj = {"error": {"message": err_msg, "type": "no_model_available"}}
+            err_obj = {"error": {"message": err_msg, "type": "server_error", "code": "service_unavailable"}}
             if aggregate:
                 # 聚合模式：统一产出 JSON（调用方不是 SSE 客户端，
                 # 给它 data: 行只会让它 json.loads 失败）。
@@ -2684,8 +2769,7 @@ async def chat_completions(
 
 
     if client_wants_stream:
-        return StreamingResponse(_client_stream(_stream()), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return await _stream_response(_stream())
 
     # 非流式：复用同一套号池状态机，但把上游 SSE 聚合成单个 chat.completion。
     # 上游只支持流式，所以「非流式」在本网关里意味着「内部聚合」而非
@@ -2697,8 +2781,9 @@ async def chat_completions(
     if not agg_out:
         return JSONResponse(
             status_code=503,
+            headers={"Retry-After": "3"},
             content={"error": {"message": _exhaustion_message("no_account", "", 0, len(order)),
-                               "type": "no_model_available"}})
+                               "type": "server_error", "code": "service_unavailable"}})
     try:
         payload_out = json.loads(agg_out)
     except Exception:
@@ -2710,7 +2795,8 @@ async def chat_completions(
         err = payload_out["error"] or {}
         code = err.get("code")
         status = code if isinstance(code, int) and 400 <= code < 600 else 503
-        return JSONResponse(status_code=status, content=payload_out)
+        return JSONResponse(status_code=status, content=payload_out,
+                            headers={"Retry-After": "3"} if status in (429, 502, 503, 504) else {})
     return JSONResponse(content=payload_out)
 
 
@@ -2811,7 +2897,7 @@ async def responses_proxy(
                         break
                     if not retry_budget.available():
                         break
-                    acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
+                    acc_i = await _select_account_with_wait(db2, exclude_ids=tried_ids, min_balance=1,
                                             model=m, sticky_key=sticky_key,
                                                 account_id=getattr(key, "account_id", None), key_id=key.id)
                     if not acc_i:
@@ -2926,13 +3012,14 @@ async def responses_proxy(
             await _blocking_call(_record_usage, key.id, 0, resolved, 0.0, None,
                           reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="responses", seq=seq, error_kind="no_account")
             if POOL.waf.active():
-                return JSONResponse(status_code=503, content={"error": {
+                return JSONResponse(status_code=503, headers={"Retry-After": str(max(3, POOL.waf.remaining()))}, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
-                    "type": "waf_blocked"}})
+                    "type": "server_error", "code": "service_unavailable"}})
             return JSONResponse(
                 status_code=503,
+                headers={"Retry-After": "3"},
                 content={"error": {"message": _exhaustion_message(last_err_kind, last_err_msg, 0, len(order) if order else 0),
-                                   "type": "no_model_available"}})
+                                   "type": "server_error", "code": "service_unavailable"}})
         finally:
             if held_uid:
                 POOL.release(held_uid)
@@ -2974,7 +3061,7 @@ async def responses_proxy(
                             break
                         if not retry_budget.available():
                             break
-                        acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
+                        acc_i = await _select_account_with_wait(db2, exclude_ids=tried_ids, min_balance=1,
                                                 model=m, sticky_key=sticky_key,
                                                 account_id=getattr(key, "account_id", None), key_id=key.id)
                         if not acc_i:
@@ -3113,6 +3200,8 @@ async def responses_proxy(
                             return
                         except Exception as e:
                             if delivered:
+                                yield 'event: error\ndata: ' + json.dumps({"type": "error", "error": {
+                                    "message": "上游流中断，请重试", "type": "server_error", "code": "upstream_stream_interrupted"}}, ensure_ascii=False) + '\n\n'
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -3148,8 +3237,7 @@ async def responses_proxy(
                 sess_i.close()
             await _blocking_call(db2.close)
 
-    return StreamingResponse(_client_stream(_stream()), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return await _stream_response(_stream())
 
 
 @router.post("/v1/messages")
@@ -3265,7 +3353,7 @@ async def anthropic_messages(
                         break
                     if not retry_budget.available():
                         break
-                    acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
+                    acc_i = await _select_account_with_wait(db2, exclude_ids=tried_ids, min_balance=1,
                                             model=m, sticky_key=sticky_key,
                                                 account_id=getattr(key, "account_id", None), key_id=key.id)
                     if not acc_i:
@@ -3383,13 +3471,14 @@ async def anthropic_messages(
                           reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="anthropic",
                           seq=seq, error_kind="no_account")
             if POOL.waf.active():
-                return JSONResponse(status_code=503, content={"error": {
+                return JSONResponse(status_code=503, headers={"Retry-After": str(max(3, POOL.waf.remaining()))}, content={"type": "error", "error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
-                    "type": "waf_blocked"}})
+                    "type": "overloaded_error"}})
             return JSONResponse(
                 status_code=503,
-                content={"error": {"message": _exhaustion_message(last_err_kind, last_err_msg, 0, len(order) if order else 0),
-                                   "type": "no_model_available"}})
+                headers={"Retry-After": "3"},
+                content={"type": "error", "error": {"message": _exhaustion_message(last_err_kind, last_err_msg, 0, len(order) if order else 0),
+                                   "type": "overloaded_error"}})
         finally:
             if held_uid:
                 POOL.release(held_uid)
@@ -3431,7 +3520,7 @@ async def anthropic_messages(
                             break
                         if not retry_budget.available():
                             break
-                        acc_i = await _blocking_call(_select_account, db2, exclude_ids=tried_ids, min_balance=1,
+                        acc_i = await _select_account_with_wait(db2, exclude_ids=tried_ids, min_balance=1,
                                                 model=m, sticky_key=sticky_key,
                                                 account_id=getattr(key, "account_id", None), key_id=key.id)
                         if not acc_i:
@@ -3585,6 +3674,7 @@ async def anthropic_messages(
                             return
                         except Exception as e:
                             if delivered:
+                                yield conv.error_event("上游流中断，请重试", "api_error")
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -3618,8 +3708,7 @@ async def anthropic_messages(
                 sess_i.close()
             await _blocking_call(db2.close)
 
-    return StreamingResponse(_client_stream(_stream()), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return await _stream_response(_stream(), anthropic=True)
 
 
 @router.post("/v1/messages/count_tokens")
@@ -3692,11 +3781,6 @@ def models(
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
     aid = getattr(key, "account_id", None)
-    acc = _select_account(db, account_id=aid, key_id=key.id, min_balance=0)
-    if not acc:
-        return JSONResponse(status_code=503,
-                            content={"error": {"message": f"无可用账号：{_no_account_reason(db, aid, key.id)}",
-                                               "type": "no_account"}})
     # 绑定了分组的 Key 只应看到组内模型，否则客户端会照着完整列表点模型然后被 403
     allowed = _key_allowed_models(db, key)
     configs = db.query(ModelConfig).all()
@@ -3709,7 +3793,14 @@ def models(
                      'credit_multiplier': row.credit_multiplier}
                     for row in configs if row.enabled and
                     (allowed is None or row.model_id in allowed)]
+            from admin.model_listing import format_entries, display_options
+            data = format_entries(data, options=display_options(db))
             return {'object': 'list', 'data': data, 'source': 'local'}
+    acc = _select_account(db, account_id=aid, key_id=key.id, min_balance=0)
+    if not acc:
+        return JSONResponse(status_code=503, headers={"Retry-After": "3"},
+                            content={"error": {"message": f"无可用账号：{_no_account_reason(db, aid, key.id)}",
+                                               "type": "server_error", "code": "service_unavailable"}})
     # 换号重试 + 错误处置，与对话端点同口径。
     #
     # 原实现只选**一次**账号，失败就直接 502 —— 既不做 `_apply_account_policy`
@@ -3745,7 +3836,8 @@ def models(
                                  not configs or m.get("id") in enabled_ids)]
                         _note_success(db, acc)
                         data = model_listing.enrich_entries(
-                            sess, data, on_error=lambda error: maintenance.note_failure(db, acc, error))
+                            sess, data, on_error=lambda error: maintenance.note_failure(db, acc, error),
+                            options=model_listing.display_options(db))
                     finally:
                         acc.auth_json = sess.updated_json()
             acc.last_used_at = datetime.utcnow()

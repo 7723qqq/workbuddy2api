@@ -78,7 +78,7 @@ def start(directory: str) -> str:
         nonce = secrets.token_urlsafe(32)
         os.environ.update({"WORKBUDDY_ANDROID": "1", "WB_DESKTOP_BOOT": nonce,
                            "ADMIN_DATABASE_URL": "sqlite:///" + (base / "workbuddy.db").as_posix(),
-                           "ADMIN_GATEWAY_LIMIT_BACKEND": "memory", "ADMIN_HOST": "127.0.0.1",
+                           "ADMIN_GATEWAY_LIMIT_BACKEND": "memory", "ADMIN_HOST": "0.0.0.0",
                            "ADMIN_USERNAME": config["username"], "ADMIN_PASSWORD": config["password"],
                            "ADMIN_JWT_SECRET": config["jwt_secret"], "ADMIN_DEV_TOOLS": "0"})
         logs = base / "logs"
@@ -99,21 +99,24 @@ def start(directory: str) -> str:
         try:
             # Reuse our listening port after accepted connections enter TIME_WAIT.
             # SO_REUSEADDR does not permit sharing an active TCP listener.
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if os.name == "nt":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             preferred = int(config.get("port", 8790))
             if not 1 <= preferred <= 65535:
                 preferred = 8790
             try:
-                sock.bind(("127.0.0.1", preferred))
+                sock.bind(("0.0.0.0", preferred))
             except OSError as error:
                 # Windows' exclusive listeners report WSAEACCES in host tests.
                 if error.errno != errno.EADDRINUSE and not (
                         os.name == "nt" and getattr(error, "winerror", None) == 10013):
                     raise
-                sock.bind(("127.0.0.1", 0))
+                sock.bind(("0.0.0.0", 0))
             port = sock.getsockname()[1]
             sock.listen(128)
-            server = MobileServer(uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None,
+            server = MobileServer(uvicorn.Config(app, host="0.0.0.0", port=port, log_config=None,
                                     access_log=False, loop="asyncio", http=MobileH11Protocol, ws="none",
                                     timeout_graceful_shutdown=5))
             _server = server
@@ -176,5 +179,5 @@ def session_token() -> str:
 def _issue_token() -> str:
     import jwt
     from admin.config import settings
-    return jwt.encode({"sub": settings.ADMIN_USERNAME, "exp": int(time.time()) + 86400},
+    return jwt.encode({"sub": settings.ADMIN_USERNAME, "local_shell": True},
                       settings.JWT_SECRET, algorithm="HS256")

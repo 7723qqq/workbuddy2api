@@ -186,6 +186,9 @@ public class MainActivity extends Activity {
     }
 
     private class MobileBridge {
+        @JavascriptInterface public String sessionToken() {
+            return bridgeTrusted && LocalApiService.token != null ? LocalApiService.token : "";
+        }
         @JavascriptInterface public synchronized boolean saveText(String request, String filename, String text, String mime) {
             if (!bridgeTrusted || destroyed || request == null || !request.matches("[0-9]{1,10}") || exportRequest != null || exportWriting || text == null) return false;
             byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
@@ -222,6 +225,10 @@ public class MainActivity extends Activity {
                 data.put("last_healthy", LocalApiService.lastHealthy);
                 data.put("notifications", notifications);
                 data.put("battery_unrestricted", power.isIgnoringBatteryOptimizations(getPackageName()));
+                android.app.ActivityManager activity = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                data.put("background_restricted", Build.VERSION.SDK_INT >= 28 && activity.isBackgroundRestricted());
+                data.put("power_save", power.isPowerSaveMode());
+                data.put("wake_lock", LocalApiService.wakeLockHeld());
                 data.put("origin", LocalApiService.origin);
                 data.put("error", LocalApiService.error);
             } catch (Exception ignored) { }
@@ -238,12 +245,24 @@ public class MainActivity extends Activity {
                 if ("notifications".equals(section) && Build.VERSION.SDK_INT >= 26) {
                     intent = new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
                         .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName());
+                } else if ("battery".equals(section)) {
+                    PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+                    if (power.isIgnoringBatteryOptimizations(getPackageName())) {
+                        intent = new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+                    } else {
+                        intent = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                            Uri.parse("package:" + getPackageName()));
+                    }
                 } else {
                     intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                         Uri.parse("package:" + getPackageName()));
                 }
                 try { startActivity(intent); }
-                catch (ActivityNotFoundException e) { Toast.makeText(MainActivity.this, "无法打开系统设置", Toast.LENGTH_SHORT).show(); }
+                catch (RuntimeException e) {
+                    try { startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                                  Uri.parse("package:" + getPackageName()))); }
+                    catch (RuntimeException ignored) { Toast.makeText(MainActivity.this, "无法打开系统设置", Toast.LENGTH_SHORT).show(); }
+                }
             });
         }
     }

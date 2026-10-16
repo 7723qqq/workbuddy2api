@@ -23,11 +23,12 @@ window.WBMobile = (() => {
     if (!initialized) {
       initialized = true;
       enterApp();
-      document.getElementById('localBoot').remove();
+      document.getElementById('localBoot')?.remove();
       document.getElementById('topbarMode').textContent = '手机本地运行';
       WBDesktop.checkUpdatesAtStartup();
       window.WBMobileSettings?.start();
     }
+    if (document.getElementById('app').classList.contains('hidden')) enterApp();
     window.dispatchEvent(new Event('wb-shell-resume'));
   }
   document.documentElement.classList.add('mobile-mode', 'desktop-mode');

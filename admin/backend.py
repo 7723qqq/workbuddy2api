@@ -230,6 +230,34 @@ class AccountSession:
     def get_headers(self, extra: dict | None = None) -> dict:
         return self.cm.get_headers(extra=extra)
 
+    def _compensation_request(self, operation: str) -> dict:
+        """Official website billing endpoints; both use an empty JSON body."""
+        paths = {"status": "/billing/meter/compensation-status",
+                 "claim": "/billing/meter/claim-compensation"}
+        headers = self.get_headers({"Origin": WEB_BASE,
+                                    "Referer": WEB_BASE + "/profile/plans-usage?action=addon"})
+        with self.http_client(timeout=15) as client:
+            response = client.post(WEB_BASE + paths[operation], headers=headers, json={})
+        try:
+            payload = response.json()
+        except ValueError:
+            return {"ok": False, "http": response.status_code, "code": None, "data": {}}
+        if not isinstance(payload, dict):
+            return {"ok": False, "http": response.status_code, "code": None, "data": {}}
+        data = payload.get("data")
+        safe = {key: data[key] for key in ("active", "claimed", "credit_num", "validity_period", "end_time")
+                if isinstance(data, dict) and key in data and isinstance(data[key], (str, int, float, bool, type(None)))}
+        code = payload.get("code")
+        code = code if type(code) is int else None
+        return {"ok": response.status_code == 200 and code == 0,
+                "http": response.status_code, "code": code, "data": safe}
+
+    def compensation_status(self) -> dict:
+        return self._compensation_request("status")
+
+    def claim_compensation(self) -> dict:
+        return self._compensation_request("claim")
+
     def fetch_models(self) -> list:
         return self.cm.fetch_models()
 

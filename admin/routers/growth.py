@@ -451,6 +451,8 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                         acc.balance_remain = int(bal.get("remain") or 0)
                         acc.last_sync_at = datetime.utcnow()
                         acc_log.update(balance_total=acc.balance_total, balance_remain=acc.balance_remain)
+                        from admin.routers.accounts import _sync_credit_snapshot
+                        _sync_credit_snapshot(acc, s.fetch_credit_details())
                     except Exception as e:
                         acc_log["balance_error"] = str(e)[:120]
                     acc.auth_json = _updated(s, acc)
@@ -526,6 +528,8 @@ def claim_accounts(account_ids: list[int], task_codes: list[str] | None,
                     acc_log["balance_total"] = acc.balance_total
                     acc_log["balance_remain"] = acc.balance_remain
                     acc.last_sync_at = datetime.utcnow()
+                    from admin.routers.accounts import _sync_credit_snapshot
+                    _sync_credit_snapshot(acc, s.fetch_credit_details())
                 except Exception as e:
                     acc_log["balance_error"] = str(e)[:120]
         except Exception as e:

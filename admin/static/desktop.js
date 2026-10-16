@@ -1,6 +1,8 @@
 /* Release Markdown is rendered locally and sanitized before insertion. */
 window.WBDesktop = (() => {
-  let native = false, initialized = false, checking = false, releases = null, dialog, poll;
+  let native = false, initialized = false, checking = false, releases = null, dialog, poll, startupPrompt = false, startupRequested = false;
+  const prompted = new Set();
+  const skippedKey = 'wb_update_skipped_version';
   const versionButton = () => document.getElementById('appVersion');
   const element = (tag, text, className) => {
     const el = document.createElement(tag);
@@ -25,6 +27,7 @@ window.WBDesktop = (() => {
     versionButton().classList.toggle('has-update', !!releases.available);
   }
   async function check(auto = false) {
+    startupRequested ||= auto;
     if (checking) return;
     checking = true;
     try {
@@ -36,33 +39,35 @@ window.WBDesktop = (() => {
       }
       label();
       if (dialog?.open) render();
-      if (auto && releases.available) {
-        // A notice does not open a modal or require a decision at startup.
-        const notice = element('div', `发现新版本 ${releases.latest.tag}，点击左下角版本号查看。`, 'card');
-        Object.assign(notice.style, {position:'fixed',bottom:'24px',right:'24px',padding:'16px',zIndex:70,cursor:'pointer'});
-        notice.addEventListener('click', () => { notice.remove(); openUpdates(); });
-        document.body.append(notice); setTimeout(() => notice.remove(), 9000);
+      if (startupRequested && releases.available && releases.latest) {
+        const tag = releases.latest.tag;
+        let skipped = '';
+        try { skipped = localStorage.getItem(skippedKey); } catch (_) {}
+        if (tag !== skipped && !prompted.has(tag)) {
+          prompted.add(tag);
+          showUpdates(true);
+        }
       }
     } catch (error) {
       if (releases) releases.error = error.message;
       else releases = {version:'—', releases:[], error:error.message};
       if (dialog?.open) render();
-    } finally { checking = false; }
+    } finally { checking = false; startupRequested = false; }
   }
   function render() {
     dialog.replaceChildren();
     const header = element('div', undefined, 'wb-update-header');
-    header.append(element('h2', '版本与更新'), button('关闭', () => dialog.close()));
+    header.append(element('h2', startupPrompt ? '发现新版本' : '版本与更新'), button('关闭', () => dialog.close()));
     dialog.append(header, element('p', `当前版本 v${releases?.version || '…'} · 更新由你决定`, 'wb-update-meta'));
     if (releases?.error) dialog.append(element('p', releases.error, 'wb-update-meta'));
     const actions = element('div', undefined, 'wb-update-actions');
     actions.append(button('重新检查', () => check()), link('打开 Releases', 'https://github.com/xiaofan6ya/workbuddy2api/releases'));
     const latest = releases?.latest;
-    if (window.WBMobile && latest?.asset) {
-      actions.append(link('下载新版 APK', latest.asset.browser_download_url));
+    if (!native && latest?.asset) {
+      actions.append(link(window.WBMobile ? '下载最新版 APK' : '下载最新版 EXE', latest.asset.browser_download_url));
     }
     if (native && latest?.installable) {
-      const download = button('下载更新', async () => {
+      const download = button('下载最新版', async () => {
         download.disabled = true;
         try {
           const result = await pywebview.api.download_update(latest.id);
@@ -76,6 +81,14 @@ window.WBDesktop = (() => {
       dialog.append(element('p', window.WBMobile ? '该版本尚未提供 Android APK 或校验文件，可在 Releases 查看。' : '该版本尚未提供 Windows EXE 或校验文件，可在 Releases 查看。', 'wb-update-meta'));
     }
     dialog.append(actions);
+    if (startupPrompt && latest) {
+      const defer = element('div', undefined, 'wb-update-actions');
+      defer.append(button('稍后再说', () => dialog.close()), button('暂不更新此版本', () => {
+        try { localStorage.setItem(skippedKey, latest.tag); } catch (_) {}
+        dialog.close();
+      }));
+      dialog.append(defer);
+    }
     const status = element('p', releases?.update?.message || '', 'wb-update-meta');
     status.id = 'wbUpdateStatus'; dialog.append(status);
     const install = button('重启并安装更新', async () => {
@@ -86,17 +99,12 @@ window.WBDesktop = (() => {
       } catch (error) { status.textContent = error.message; }
       finally { install.disabled = false; }
     }, true);
-    install.id = 'wbUpdateInstall'; install.hidden = !releases?.update?.ready; dialog.append(install);
+    install.id = 'wbUpdateInstall'; install.hidden = !native || !releases?.update?.ready; dialog.append(install);
+    if (latest) dialog.append(releaseNotes(latest, '最新版本'));
     const history = element('div', undefined, 'wb-update-history');
     history.append(element('h3', '历史版本'));
     for (const row of releases?.releases || []) {
-      const item = element('section', undefined, 'wb-update-release');
-      const notes = element('div', undefined, 'wb-release-markdown');
-      if (window.WBReleaseNotes) WBReleaseNotes.render(notes, row.body);
-      else notes.textContent = row.body;
-      item.append(element('h3', row.name), element('p', `${row.tag} · ${row.date ? new Date(row.date).toLocaleString() : ''}`, 'wb-update-meta'),
-        notes, link('查看此版本', row.url));
-      history.append(item);
+      if (row.id !== latest?.id) history.append(releaseNotes(row));
     }
     if (!releases?.releases?.length) history.append(element('p', '暂无已发布版本。', 'wb-update-meta'));
     dialog.append(history);
@@ -106,6 +114,16 @@ window.WBDesktop = (() => {
       dialog.append(button('重试准备运行环境', () => pywebview.api.retry_runtime()));
       watchDownload();
     }
+  }
+  function releaseNotes(row, heading) {
+    const item = element('section', undefined, 'wb-update-release');
+    const notes = element('div', undefined, 'wb-release-markdown');
+    if (window.WBReleaseNotes) WBReleaseNotes.render(notes, row.body);
+    else notes.textContent = row.body || '暂无更新说明';
+    item.append(element('h3', `${heading ? heading + ' · ' : ''}${row.name || row.tag}`),
+      element('p', `${row.tag} · ${row.date ? new Date(row.date).toLocaleString() : ''}`, 'wb-update-meta'),
+      notes, link('查看此版本', row.url));
+    return item;
   }
   function watchDownload() {
     clearInterval(poll);
@@ -120,17 +138,25 @@ window.WBDesktop = (() => {
         document.getElementById('wbRuntimeStatus').textContent = result.runtime;
         document.getElementById('wbUpdateInstall').hidden = !result.ready;
         if (releases) releases.update = result;
+      } catch (_) {
+        const status = document.getElementById('wbUpdateStatus');
+        if (status) status.textContent = '更新状态暂不可用，请稍后重试';
       } finally { polling = false; }
     }, 1000);
   }
-  async function openUpdates() {
+  function showUpdates(auto = false) {
+    startupPrompt = auto;
     if (!dialog) {
       dialog = element('dialog', undefined, 'wb-update-dialog');
       dialog.setAttribute('aria-label', '版本与更新'); document.body.append(dialog);
       dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
       dialog.addEventListener('close', () => clearInterval(poll));
     }
-    render(); if (!dialog.open) dialog.showModal(); await check();
+    render(); if (!dialog.open) dialog.showModal();
+  }
+  async function openUpdates() {
+    showUpdates();
+    await check();
   }
   async function initializeNative() {
     if (initialized) return;
@@ -140,7 +166,7 @@ window.WBDesktop = (() => {
       TOKEN = result.token; localStorage.setItem(TOKEN_KEY, TOKEN);
       // Existing persisted token may already have entered the application.
       if (document.getElementById('app').classList.contains('hidden')) enterApp();
-      document.getElementById('localBoot').remove();
+      document.getElementById('localBoot')?.remove();
       document.getElementById('topbarMode').textContent = '本地运行';
     } catch (error) {
       document.getElementById('localBootStatus').textContent = `本地连接失败：${error.message}`;

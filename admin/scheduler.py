@@ -8,6 +8,7 @@
   - sync_models：从后端拉取最新模型列表并 upsert 倍率
 """
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta
@@ -17,6 +18,8 @@ from admin.models import Schedule
 from admin.config import settings
 from admin import maintenance
 from collections import Counter
+
+_logger = logging.getLogger(__name__)
 
 #: last_result 是 TEXT，存得下完整 JSON；但仍给一个上限，
 #: 防止某个任务的明细异常膨胀把这一行撑爆。
@@ -190,6 +193,9 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         return res
     if task == "daily_checkin":
         return run_daily_checkin(db, schedule)
+    if task == "claim_benefits":
+        from admin.benefits import run_scheduled
+        return run_scheduled(db, schedule)
     if task == "refresh_growth_tasks":
         return run_refresh_growth_tasks()
     if task == "run_growth_tasks":
@@ -581,6 +587,16 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
                         credit = int(res.get("credit") or 0)
                         claimed += 1
                         total_credit += credit
+                        try:
+                            from admin.routers.accounts import _sync_credit_snapshot
+                            balance = sess.fetch_balance()
+                            a.balance_total = int(balance.get("total") or 0)
+                            a.balance_remain = int(balance.get("remain") or 0)
+                            a.last_sync_at = datetime.utcnow()
+                            _sync_credit_snapshot(a, sess.fetch_credit_details())
+                        except Exception as error:
+                            errors.append(f"{label}:奖励已领取，余额或到期快照刷新失败")
+                            _logger.warning("签到后资源刷新失败 account_id=%s: %s", a.id, type(error).__name__)
                         detail.append({
                             "account_id": a.id, "account": label, "ok": True,
                             "status": "claimed", "credit": credit,
@@ -604,6 +620,7 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
                                        "credit": 0, "reason": str(reason)})
                 # 写回可能已刷新的 token（签到请求会触发鉴权头刷新）
                 a.auth_json = sess.updated_json()
+                db.commit()
         except Exception as e:
             failed += 1
             reason = _short_error(e)
@@ -1060,6 +1077,8 @@ def start_scheduler():
         ensure_keepalive_schedule(db)
         ensure_credit_schedule(db)
         ensure_growth_plan_schedule(db)
+        from admin.benefits import ensure_schedule
+        ensure_schedule(db)
         from admin.growth_center import import_last_run
         import_last_run(db)
         db.close()

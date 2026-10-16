@@ -1,51 +1,50 @@
-version: "3.8"
-
 services:
-  workbuddy2api:
+  admin:
     build: .
-    container_name: workbuddy2api
+    ports:
+      - "${ADMIN_PORT:-8790}:8790"
+    volumes:
+      - admin_data:/data
+    environment:
+      ADMIN_HOST: 0.0.0.0
+      ADMIN_PORT: 8790
+      ADMIN_DATABASE_URL: sqlite:////data/workbuddy.db
+      ADMIN_REDIS_URL: ""
+      ADMIN_GATEWAY_LIMIT_BACKEND: memory
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env.docker}
+      ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET:?Set ADMIN_JWT_SECRET in .env.docker}
+      TZ: Asia/Shanghai
+    command: ["python3", "-m", "uvicorn", "admin.server:app", "--host", "0.0.0.0", "--port", "8790"]
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/api/app/version', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional standalone single-account converter. Admin already serves /v1/*.
+  converter:
+    profiles: ["standalone"]
+    build: .
     ports:
       - "8787:8787"
     volumes:
-      # 挂载宿主机的 CodeBuddy 登录凭据（macOS 示例，请按你的系统修改路径）
-      - ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro
+      - ./credentials:/data/auth:ro
     environment:
-      # 如需鉴权，设置 API Key（客户端请求时需携带相同的 key）
-      - CODEBUDDY2OPENAI_KEY=
-      # 指定 auth 文件挂载路径（转换器会自动读取）
-      - CODEBUDDY_AUTH_DIR=/data/auth
-      # 出站 UA 报的客户端版本。容器里没有桌面端安装包可读，所以会自动退化到
-      # 内置兜底值；想让 UA 与实际客户端一致，就显式指定（见 .env.example）。
-      # - WORKBUDDY_DESKTOP_VERSION=5.5.6
-      # - WORKBUDDY_CLI_VERSION=2.137.1
-    command: >
-      python3 converter.py
-      --host 0.0.0.0
-      --port 8787
-      --skip-check
-      --desensitize
+      CODEBUDDY2OPENAI_KEY: ${CODEBUDDY2OPENAI_KEY:-}
+      CODEBUDDY_AUTH_DIR: /data/auth
+    command: ["python3", "converter.py", "--host", "0.0.0.0", "--port", "8787", "--skip-check", "--desensitize"]
     restart: unless-stopped
+    init: true
 
-  # 管理后台（多账号反代 + API Key 网关）。
-  # 默认连本机已在运行的 MySQL(3306)/Redis(6379)；若改到容器内实例，
-  # 把下方 ADMIN_DATABASE_URL / ADMIN_REDIS_URL 指向对应服务名即可。
-  admin:
-    build: .
-    container_name: workbuddy_admin
-    ports:
-      - "8790:8790"
-    environment:
-      - ADMIN_PORT=8790
-      - ADMIN_DATABASE_URL=mysql+pymysql://root:root@127.0.0.1:3306/workbuddy_admin?charset=utf8mb4
-      - ADMIN_REDIS_URL=redis://127.0.0.1:6379/0
-      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-123456}
-      # 出站 UA / 桌面事件指纹报的客户端版本。容器里读不到宿主机的安装包，
-      # 会自动退化到兜底值；要准确就显式指定（见 .env.example）。
-      # - WORKBUDDY_DESKTOP_VERSION=5.5.6
-      # - WORKBUDDY_CLI_VERSION=2.137.1
-    command: >
-      python3 -m uvicorn admin.server:app
-      --host 0.0.0.0
-      --port 8790
-    restart: unless-stopped
+volumes:
+  admin_data:
