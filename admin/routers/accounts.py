@@ -980,7 +980,9 @@ def _run_refresh_batch(ids, job):
                 with maintenance.account_slot(account, db) as blocked:
                     lease = _Lease(db, 'account_refresh:' + uid + ':lease')
                     if blocked or uid in seen:
-                        item.update(status='skipped', reason='账号停用、占用、受保护或本轮重复，已跳过')
+                        item.update(status='skipped',
+                                    reason=maintenance.skip_reason_text(blocked) if blocked
+                                    else '同一账号在本轮里重复出现，已跳过')
                     elif not lease.acquire():
                         item.update(status='skipped', reason='账号正在刷新，已跳过重复执行')
                     else:

@@ -29,6 +29,30 @@ def _reason(account):
     return None
 
 
+#: _reason() / account_slot() 的原因码 → 界面文案。各调用方（后台批量刷新、
+#: 权益领取）共用一份，避免同一个原因在不同页面被描述成不同的话。
+#: 不翻译的话，多种原因会被压成一句泛泛的描述，其中最需要用户行动的
+#: 「登录态失效」往往不在那句话里。
+_SKIP_REASON_TEXT = {
+    "waf": "出口 IP 正被上游 WAF 拦截，暂时保护中",
+    "inactive": "账号已停用",
+    "account_cooling": "账号处于冷却 / 熔断 / 降权期",
+    "login_required": "登录态已失效，需在客户端重新登录后导入",
+    "background_busy": "后台批量任务正在运行",
+    "inflight": "账号在途占用已满",
+}
+
+
+def skip_reason_text(reason, action: str = "已跳过") -> str:
+    """把跳过原因码翻成给人看的文案；未知码原样带出，不吞掉信息。"""
+    if not reason:
+        return f"账号本轮不可用，{action}"
+    text = _SKIP_REASON_TEXT.get(reason)
+    if text is None:
+        return f"账号不可用（{reason}），{action}"
+    return f"{text}，{action}"
+
+
 @contextmanager
 def account_slot(account, db=None):
     """Skip busy/restricted accounts; release reservations even on failure.

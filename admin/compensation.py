@@ -113,7 +113,7 @@ def process_account(db, account, *, claim=True, source='manual', discover=False)
     with maintenance.account_slot(account, db) as blocked:
         if blocked:
             return {'status': 'deferred', 'ok': False, 'credit': 0,
-                    'reason': '账号停用、占用或处于保护中，已顺延', 'skip_reason': blocked}
+                    'reason': maintenance.skip_reason_text(blocked, '已顺延'), 'skip_reason': blocked}
         key = _key(account)
         lease = _Lease(db, key + ':lease')
         if not lease.acquire():
