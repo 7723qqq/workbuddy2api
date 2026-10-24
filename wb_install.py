@@ -28,9 +28,10 @@
 安装目录（命中即用，第一个含 `resources/app.asar` 的目录胜出）::
 
     1. WORKBUDDY_INSTALL_DIR            显式指定（最高优先级）
-    2. 常见安装基目录下的 WorkBuddy / workbuddy
+    2. 常见安装基目录下的 WorkBuddy / workbuddy / WorkBuddyAI
        （%LOCALAPPDATA% / %APPDATA% / %ProgramFiles% / %ProgramFiles(x86)%
-         / %USERPROFILE% / %HOME%）
+         / %USERPROFILE% / %HOME%），另外 %LOCALAPPDATA%\\Programs\\<App>
+       —— 新版安装器（electron-builder / NSIS）的默认落点
     3. 各盘根目录下的 workbuddy / WorkBuddy / WorkBuddy-<ver>（默认 C,D,E,F,G）
        —— 盘符可用 WORKBUDDY_DRIVES 覆盖
 
@@ -110,7 +111,14 @@ DEFAULT_COMMIT = "5f9692923c93033111c51ad7b003eb80204a9b75"
 DEFAULT_RELEASE_DATE_MS = 1789036585355
 
 #: 安装基目录名候选（大小写变体都要试：Windows 上不区分，Linux 上区分）
-_BASE_NAMES = ("WorkBuddy", "workbuddy")
+#:
+#: WorkBuddyAI 是官方桌面端在新版安装器下的目录名（2026-10-24 实测本机就是
+#: %LOCALAPPDATA%\Programs\WorkBuddyAI）。不认这个名字就永远「未发现本机客户端」。
+_BASE_NAMES = ("WorkBuddy", "workbuddy", "WorkBuddyAI")
+
+#: 用户级安装根目录名（electron-builder / NSIS 的默认落点）：
+#: %LOCALAPPDATA%\Programs\<AppName>。装在这里是常态，必须单独扫一层。
+_PROGRAMS_SUBROOT = "Programs"
 
 #: 参与扫描的默认盘符（Windows）。用 WORKBUDDY_DRIVES 覆盖。
 _DEFAULT_DRIVES = "C,D,E,F,G"
@@ -522,6 +530,9 @@ class _WorkBuddyInstall:
                 continue
             for name in _BASE_NAMES:
                 out.append(Path(base) / name)
+                # 用户级安装根 %LOCALAPPDATA%\Programs\<App>（新版安装器默认落点）
+                if ev == "LOCALAPPDATA":
+                    out.append(Path(base) / _PROGRAMS_SUBROOT / name)
 
         # 3) 各盘根目录
         drives = (os.getenv("WORKBUDDY_DRIVES") or "").strip() or _DEFAULT_DRIVES
