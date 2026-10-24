@@ -122,6 +122,13 @@ SENSITIVE_TERMS: list[str] = [
     "Anthropic",
     "Co-Authored-By",
     "noreply@anthropic.com",
+    # 其他客户端品牌 / 身份词（取自上游）
+    "Kimi",
+    "Qwen",
+    "Cursor",
+    "OpenCode",
+    "agent-identity",
+    "OhMyOpenCode",
 ]
 
 # 编译成一个大正则，按词长降序，避免短词先吃掉长词。

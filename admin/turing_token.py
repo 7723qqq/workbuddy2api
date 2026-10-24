@@ -94,6 +94,10 @@ def get_device_token(force: bool = False) -> str | None:
         return None
 
     env = dict(os.environ)
+    # 给 helper 下发时间预算：helper 内部的重试/看门狗总预算必须小于本侧的
+    # subprocess 超时，否则进程会被先杀掉，已经取到的 token 也白拿。
+    # 留 2s 余量给 node 启动与 SDK 发现。
+    env.setdefault("TURING_DEADLINE_MS", str(int((_RUN_TIMEOUT - 2) * 1000)))
     # 不写死 SDK 目录：若用户显式设置了 WORKBUDDY_TURING_SDK_DIR 则下发，
     # 否则交给 turing_helper.js 按本机安装位置自动发现（不同用户安装目录不同）。
     # 注意：不要在此处兜底写死某个绝对路径，否则会覆盖 helper 的自动发现逻辑。

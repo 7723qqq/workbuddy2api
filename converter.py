@@ -236,7 +236,8 @@ def _get_turing_device_token() -> str | None:
     try:
         from admin.turing_token import get_device_token
         return get_device_token()
-    except Exception:
+    except Exception as error:
+        _log(f"获取 device token 错误：{error}")
         return None
 
 
@@ -284,6 +285,28 @@ class CredentialManager:
         with open(self.path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _read_decrypted(self) -> dict:
+        """读取 auth 文件；若含 $wbEncrypted 加密字段则解密后返回（不修改原文件）。
+
+        新版客户端把 accessToken / refreshToken 等字段用 AES-256-GCM 信封加密，
+        直接读会拿到 `{"$wbEncrypted":1,"envelope":"..."}` 而不是明文。
+
+        解密复用 admin.credential_codec：密钥从本机已安装的客户端（或管理员配置的
+        密钥文件）取，**不在代码里内置**。解密不可用时按原文返回 —— 后续校验会给出
+        明确的报错，而不是让网关拿着没解开的信封去请求上游。
+        """
+        raw = self._read_raw()
+        try:
+            from admin.credential_codec import normalize_credential
+            plain = normalize_credential(json.dumps(raw, ensure_ascii=False))
+            data = json.loads(plain)
+        except Exception as e:
+            _log(f"auth 文件解密跳过：{e}")
+            return raw
+        if data != raw:
+            _log("已解密 auth 文件中的加密字段")
+        return data
+
     def _load_if_stale(self):
         """若文件 mtime 变了（外部刷新过），重新加载缓存。"""
         if self.path is None:
@@ -293,7 +316,7 @@ class CredentialManager:
         except OSError:
             return
         if self._cached is None or mt != self._mtime:
-            self._cached = self._read_raw()
+            self._cached = self._read_decrypted()
             self._mtime = mt
 
     def _session(self) -> dict:
@@ -390,6 +413,8 @@ class CredentialManager:
         # 取不到（桌面端未安装 / SDK 不支持）时优雅降级为不带该头，不影响主流程。
         tok = _get_turing_device_token()
         if tok:
+            # 只记前缀：设备 token 是风控凭据，不整串落日志
+            _log(f"获取到 device token：{tok[:8]}…")
             h["X-Device-Token"] = tok
         return h
 
@@ -636,7 +661,13 @@ app = FastAPI(title="codebuddy2openai", version="2.0",
               redoc_url="/redoc" if _ENABLE_DOCS else None,
               openapi_url="/openapi.json" if _ENABLE_DOCS else None)
 CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
-                "desensitize": False, "no_compact": False}  # cred: CredentialManager | None
+                "desensitize": False, "no_compact": False,
+                # 剥离流式 delta 里的空 content / 空 reasoning_content：AI SDK 只要看到
+                # delta 里出现 content 字段就认为「文本已开始」，会提前结束 reasoning
+                # 周期，把一次回答切成上百个 "Thought for 2ms"。开关在 upstream_compat
+                # （WORKBUDDY_STRIP_EMPTY_DELTA=0 可关）。
+                "strip_empty_delta": upstream_compat.STRIP_EMPTY_DELTA,
+                }  # cred: CredentialManager | None
 
 
 # ---------------------------------------------------------------------------
@@ -1291,7 +1322,10 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
         return body
     return desensitize_body(
         body,
-        roles=("system", "developer"),
+        # 角色范围：system / developer 是系统提示词（Claude Code 走 developer），
+        # assistant 是模型自己上一轮的回答 —— 里面也可能带合规声明模板，
+        # 一并脱敏（取自上游的「脱敏角色扩张」）。
+        roles=("system", "developer", "assistant"),
         desensitize_harness_user=True,
         desensitize_tools=True,
         compact_harness=(force_compact or not CONFIG.get("no_compact")),
@@ -1405,7 +1439,7 @@ async def create_response(request: Request,
             raise HTTPException(status_code=status_code, detail=_safe_err_raw(raw, status_code))
         converter = ResponsesStreamConverter(model=model_name)
         for line in raw.decode("utf-8", "replace").splitlines():
-            converter.feed_line(line)
+            converter.feed_line(upstream_compat.normalize_sse_line(line))
         chat_body = final_body
     except HTTPException:
         raise
@@ -1437,7 +1471,9 @@ async def _stream_responses(url: str, headers: dict, body: dict,
         for line in raw.decode("utf-8", "replace").splitlines():
             if line.strip():
                 raw_sse_lines.append(line)
-            events = converter.feed_line(line)
+            # 先剥掉空的 content / reasoning_content：否则下游 SDK 会把「空正文」
+            # 当成文本开始，把一次回答切碎成大量短思考块。
+            events = converter.feed_line(upstream_compat.normalize_sse_line(line))
             if events:
                 yield events.encode("utf-8")
     except httpx.HTTPError as e:
@@ -1610,7 +1646,8 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
                     yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
                     return
                 async for line in r.aiter_lines():
-                    events = converter.feed_line(line)
+                    # 同上：先归一化 delta，再交给 Anthropic 事件转换器
+                    events = converter.feed_line(upstream_compat.normalize_sse_line(line))
                     if events:
                         yield events.encode("utf-8")
     except httpx.HTTPError as e:

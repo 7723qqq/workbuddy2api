@@ -532,8 +532,14 @@ CC Switch 中对应填写 Anthropic 服务地址、后台 API Key 和模型。�
 | `CONVERTER_DESENSITIZE` / `CONVERTER_LOG` | 内嵌 converter 的文本兼容处理与日志位置 |
 | `ADMIN_ENABLE_DOCS` / `ADMIN_DEV_TOOLS` | 交互式 API 文档与本机开发辅助功能开关 |
 | `WORKBUDDY_INSTALL_DIR` / `WORKBUDDY_ASAR_PATH` / `WORKBUDDY_DRIVES` | 官方客户端安装位置自动发现的覆盖项 |
+| `WORKBUDDY_TURING_SDK_DIR` | 设备风控 Token 的 SDK 目录覆盖；不设时自动发现桌面端安装位置，仍找不到则用仓库内置的 `turing-sdk/`（macOS 用 `macos-turing-sdk/`） |
+| `WORKBUDDY_STRIP_EMPTY_DELTA` | 是否剥离流式 delta 里的空 `content` / 空 `reasoning_content`，默认 `1`；关闭后部分 SDK 会把一次回答切成大量短思考块 |
+| `TURING_ATTEMPTS` / `TURING_ATTEMPT_TIMEOUT_MS` / `TURING_TOTAL_BUDGET_MS` | 设备 Token 的重试次数、单次看门狗与总预算（毫秒），仅 `turing_helper.js` 读取 |
+| `TURING_TOKEN_CACHE_TTL_MS` / `TURING_TOKEN_STALE_MS` / `TURING_NO_CACHE` | 设备 Token 磁盘缓存的有效期、过期兜底窗口与禁用开关 |
 
 `ADMIN_CLIENT_AUTH_DIR` 用于后台扫描/切换账号，`CODEBUDDY_AUTH_DIR` 用于 converter，二者不能混为一项。服务用户与桌面登录用户不同的 Windows 部署，应填写该用户可读的绝对路径，避免 `%LOCALAPPDATA%` 指向系统账户目录。
+
+设备风控 Token（`X-Device-Token`）由 `turing_helper.js` 取：先在桌面端安装目录里找原生桥接，找不到就用仓库内置的 `turing-sdk/`；macOS 上额外加载 `mainq_drain.node` 泵主队列，避免 SDK 在主队列上死等导致「有时能取到、有时超时」。取不到时网关降级为不带该头，不影响主流程。
 
 ## 稳定性与流量治理
 

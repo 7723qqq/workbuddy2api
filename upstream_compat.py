@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import codecs
 import json
+import os
 import re
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # 1. 模型目录解析（能力层）
@@ -895,10 +897,27 @@ def drop_truncated_tool_calls(msg: dict) -> int:
 # 注意 `tool_calls: null` **保留**：那是「本片没有该字段」的显式写法，
 # 删掉与保留语义一致，但保留更贴近上游原样，便于排障。
 
+#: 是否剥离空的 content / reasoning_content。取自上游 DistPub/workbuddy2api 的修复。
+#:   AI SDK（Codex CLI / Claude Agent SDK / Vercel AI SDK）只看 delta 里有没有
+#:   content 字段就认为「文本已经开始」，于是提前结束当前 reasoning 周期；下一片
+#:   只有 reasoning_content 又开启新周期 —— 一次回答被切成上百个 "Thought for 2ms"。
+#:   置 WORKBUDDY_STRIP_EMPTY_DELTA=0 可关闭（排障用）。
+STRIP_EMPTY_DELTA = os.environ.get("WORKBUDDY_STRIP_EMPTY_DELTA", "1").strip().lower() \
+    not in ("0", "false", "no")
+
+#: 空文本字段：值为 None 或空串都算「没有正文」。
+_EMPTY_DELTA_KEYS = ("content", "reasoning_content")
+
+
+def _is_empty_delta_content(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value == "")
+
+
 def strip_empty_delta_placeholders(delta: dict) -> int:
     """删除 delta 里语义为空的占位字段，就地改写。返回删除的键数。
 
-    只处理上面列出的键，其余字段一律不动。
+    除上面列出的键外，还会删掉**空的** content / reasoning_content
+    （见 :data:`STRIP_EMPTY_DELTA` 的说明）；其余字段一律不动。
     """
     if not isinstance(delta, dict):
         return 0
@@ -915,22 +934,82 @@ def strip_empty_delta_placeholders(delta: dict) -> int:
     if "extra_fields" in delta and delta["extra_fields"] is None:
         delta.pop("extra_fields", None)
         removed += 1
+    if STRIP_EMPTY_DELTA:
+        for k in _EMPTY_DELTA_KEYS:
+            if k in delta and _is_empty_delta_content(delta.get(k)):
+                delta.pop(k, None)
+                removed += 1
     return removed
 
 
 def normalize_stream_chunk(obj: dict) -> int:
-    """归一化一个上游 SSE chunk 的 choices[].delta。返回删除的键总数。
+    """归一化一个上游 SSE chunk 的 choices[].delta。返回改动总数。
 
     仅动 delta，不动 usage / id / model 等其它字段。
+
+    除了删除空占位键，还会在某个 choice 的 delta 归一化后**完全为空**
+    （既没正文也没工具调用）时丢掉整个 choice —— 这种 choice 对客户端没有信息量，
+    留着反而会让部分客户端以为「这一片是空正文」。但带 finish_reason 的收尾
+    choice 会保留（只把 delta 清空），否则客户端收不到结束信号。
     """
-    total = 0
-    for choice in (obj.get("choices") or []):
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return 0
+    changed = 0
+    new_choices: list = []
+    for choice in choices:
         if not isinstance(choice, dict):
+            new_choices.append(choice)
             continue
         delta = choice.get("delta")
-        if isinstance(delta, dict):
-            total += strip_empty_delta_placeholders(delta)
-    return total
+        if not isinstance(delta, dict):
+            new_choices.append(choice)
+            continue
+        removed = strip_empty_delta_placeholders(delta)
+        if not removed:
+            new_choices.append(choice)
+            continue
+        changed += removed
+        if delta:
+            new_choices.append(choice)   # delta 已被就地改写
+        elif choice.get("finish_reason"):
+            new_choices.append({
+                "index": choice.get("index", 0),
+                "delta": {},
+                "finish_reason": choice["finish_reason"],
+            })
+        # 否则：整个 choice 丢弃
+    if changed:
+        obj["choices"] = new_choices
+    return changed
+
+
+def normalize_sse_line(line: str) -> str:
+    """归一化单条 SSE 行里的 delta（就地改写 choices[].delta）。
+
+    只处理 `data:` 行；非 data 行、空载荷、`[DONE]`、解析失败的行一律原样返回
+    （绝不吞）。改写时保留原有的前导空白与 CRLF 行尾，避免破坏 SSE 分帧。
+    """
+    cr = "\r" if line.endswith("\r") else ""
+    body = line[:-1] if cr else line
+
+    stripped = body.strip()
+    if not stripped.startswith("data:"):
+        return line
+    payload = stripped[5:].strip()
+    if payload in ("", "[DONE]"):
+        return line
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return line
+    if not isinstance(obj, dict):
+        return line
+    if not normalize_stream_chunk(obj):
+        return line
+    # 保留原有的前导空白（有的上游会写 "data:  {"）
+    lead = body[:len(body) - len(body.lstrip())]
+    return f"{lead}data: {json.dumps(obj, ensure_ascii=False)}{cr}"
 
 
 class StreamDeltaNormalizer:
@@ -983,30 +1062,10 @@ class StreamDeltaNormalizer:
         return rest.encode("utf-8")
 
     def _rewrite_line(self, line: str) -> str:
-        # 保留 CRLF：分离出行尾的 \r，处理完再拼回去
-        cr = "\r" if line.endswith("\r") else ""
-        body = line[:-1] if cr else line
-
-        stripped = body.strip()
-        if not stripped.startswith("data:"):
-            return line
-        payload = stripped[5:].strip()
-        if payload in ("", "[DONE]"):
-            return line
-        try:
-            obj = json.loads(payload)
-        except Exception:
-            return line
-        if not isinstance(obj, dict):
-            return line
-
-        if not normalize_stream_chunk(obj):
-            return line
-
-        self.removed += 1
-        # 保留原有的前导空白（有的上游会写 "data:  {")
-        lead = body[:len(body) - len(body.lstrip())]
-        return f"{lead}data: {json.dumps(obj, ensure_ascii=False)}{cr}"
+        rewritten = normalize_sse_line(line)
+        if rewritten != line:
+            self.removed += 1
+        return rewritten
 
 
 class StreamCommitBuffer:
