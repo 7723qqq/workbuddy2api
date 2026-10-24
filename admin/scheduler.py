@@ -208,22 +208,6 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
     return {"task": task, "error": "未知任务类型"}
 
 
-#: token 保活：连续多少次「session 已死」才把账号禁用。
-#: 与 proxy 的 SESSION_DEAD_THRESHOLD 同源 —— 一次 12153 只说明这次刷新失败，
-#: 可能是上游抖动；连续失败才说明这个号的登录态真的废了，需要人工重登。
-_KEEPALIVE_DEAD_THRESHOLD = 3
-
-
-#: 刷新/鉴权返回里代表「服务端会话已被删除」的标记 —— OAuth 标准语义，属**终态**。
-#: 与文案式的 12153 抖动区分开：命中这些就没有重试价值，应立即禁用并提示重登。
-_AUTH_DEAD_MARKERS = (
-    "invalid_grant",
-    "offline user session not found",
-    "refresh token failed",
-    "session not found",
-)
-
-
 def _access_token_of(sess) -> str:
     """从 AccountSession 里取当前 accessToken（用于判断是否真的刷新了）。"""
     try:
@@ -321,46 +305,24 @@ def run_keepalive_tokens(db) -> dict:
                 # 传 0 会把 401 归成 transport（网络抖动），于是失效号永远不被发现
                 # ——这正是「xx 个号失效、保活却报全好」的最后一环。
                 http_status = _extract_http_status(msg)
+                # note_failure 内部按统一分类落库：WAF/限流写策略，401/403 与
+                # `invalid_grant` 这类终态写「登录态失效」标记并（权威失效时）
+                # 直接禁用 —— 标记的口径只有 maintenance.note_dead_session 一处，
+                # 后台任务与请求路径因此不会再各写一套。
                 kind = maintenance.note_failure(db, a, e)
-                # Only explicit session failures count toward disabling. Account
-                # restrictions and WAF use the same cooling policy as conversations.
+                failed += 1
                 if kind == "session_dead":
                     dead_ids.append(a.id)
-                    a.session_dead_fails = (a.session_dead_fails or 0) + 1
-                    a.cool_kind = "session_dead"
-                    a.last_err_at = datetime.utcnow()
-                    # 权威判定：登录态被上游**明确拒绝**，重试多少次都一样 → 立即禁用。
-                    #
-                    # 两种都算权威：
-                    #   * HTTP 401/403；
-                    #   * 刷新接口返回的 `invalid_grant` /
-                    #     `Offline user session not found` —— 这是 OAuth 标准里
-                    #     「该会话已在服务端被删除」的语义，属于**终态**，
-                    #     与「文案式 12153 抖动」完全不同（实测那 xx 个号正是这个）。
-                    authoritative = (http_status in (401, 403)
-                                     or any(m in msg.lower() for m in _AUTH_DEAD_MARKERS))
-                    threshold = 1 if authoritative else _KEEPALIVE_DEAD_THRESHOLD
-                    if authoritative:
-                        a.last_err_msg = (
-                            f"登录态被上游拒绝（HTTP {http_status}），需重新登录：{msg[:150]}"
-                        )[:255]
-                    else:
-                        a.last_err_msg = (msg or "keepalive 探测失败")[:255]
-                    if a.session_dead_fails >= threshold:
-                        a.status = "disabled"
-                        a.cool_until = None
-                        a.breaker_until = None
-                        a.degrade_until = None
+                    # 权威失效（401/403、invalid_grant）在 note_dead_session 里
+                    # 一次即禁用；文案式 12153 抖动要连续失败达阈值才禁用。
+                    if a.status != "active":
                         dead_disabled += 1
-                    db.commit()
-                    failed += 1
                     if len(errors) < 5:
                         errors.append(f"#{a.id}: 登录态失效（{kind}"
-                                      f"{'，HTTP ' + str(http_status) if authoritative else ''}）")
+                                      f"{'，HTTP ' + str(http_status) if http_status in (401, 403) else ''}）")
                 else:
                     # Transport failures do not disable credentials; WAF/rate
                     # restrictions have already been recorded by note_failure.
-                    failed += 1
                     if len(errors) < 5:
                         errors.append(f"#{a.id}: {kind} {msg[:90]}")
             finally:
@@ -467,7 +429,11 @@ def run_growth_tasks() -> dict:
         else:
             detail.append({"account_id": aid, "account": label,
                            "ok": False, "credit": credit_i, "tasks_done": n_done,
-                           "reason": _short_error(r.get("error") or "未知原因")})
+                           # run_accounts 把失败原因写在 `msg` 上，以前这里读的是
+                           # 永远不存在的 `error` 键，于是失败原因**一律**显示
+                           # 「未知原因」—— 401、超时、预算用尽全被抹平。
+                           "reason": _short_error(r.get("msg") or r.get("error")
+                                                  or "未知原因")})
 
     result = {
         "task": "run_growth_tasks",
@@ -623,7 +589,14 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
                 db.commit()
         except Exception as e:
             failed += 1
-            reason = _short_error(e)
+            # 走统一分类落库：401/403 这类**权威失效**要写成「登录态失效」标记，
+            # 那是选号门控 `_looks_login_dead()` 唯一的依据 —— 不写这一笔，
+            # 这个号明天还会被当成健康号重来一遍。摘要同时给一句人话，
+            # 而不是把上游那段 HTML 错误页原样贴到界面上。
+            kind = maintenance.note_failure(db, a, e)
+            db.commit()
+            reason = (maintenance.LOGIN_DEAD_TEXT if kind == "session_dead"
+                      else _short_error(e))
             errors.append(f"{label}:{reason}")
             detail.append({"account_id": a.id, "account": label, "ok": False,
                            "status": "error", "credit": 0, "reason": reason})

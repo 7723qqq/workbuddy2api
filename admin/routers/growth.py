@@ -459,6 +459,12 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                 db.commit()
             except Exception as e:
                 db.rollback()
+                # 失败也要按统一分类落库：401/403 会被写成「登录态失效」标记，
+                # 而那是选号门控 `_looks_login_dead()` 唯一的依据 —— 不写这一笔，
+                # 这个号明天还会被当成健康号再来一轮（界面只显示「未知原因」）。
+                from admin import maintenance
+                maintenance.note_failure(db, acc, e)
+                db.commit()
                 acc_log.update(ok=False, msg=str(e)[:160])
         out.append(acc_log)
         if on_done:
