@@ -8,6 +8,26 @@ echo   workbuddy2api Start Service
 echo ========================================
 echo.
 
+REM ---------------------------------------------------------------------------
+REM Ensure MySQL is running BEFORE we touch the service.
+REM Why: ADMIN_DATABASE_URL points at a local MySQL that is NOT registered as a
+REM Windows service, so it does not come back after a reboot. With MySQL down the
+REM app still boots, but uvicorn retries the DB 30 x 2s = 60s BEFORE it binds
+REM port 8790 -- so the 11s port check at the bottom reports a false
+REM "Start FAILED", and the watchdog keeps spawning duplicate instances meanwhile.
+REM Starting MySQL here makes the port come up in about two seconds.
+REM ---------------------------------------------------------------------------
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\ensure-mysql.ps1"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] MySQL is not available - aborting start.
+    echo         Start MySQL manually, then run this script again.
+    echo.
+    pause
+    exit /b 1
+)
+echo.
+
 REM 先停掉旧实例 / 旧守护
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\daemon.ps1" -Stop >nul 2>&1
 

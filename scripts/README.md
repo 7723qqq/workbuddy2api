@@ -7,7 +7,8 @@
 | `build_desktop.py` | 构建 Windows EXE；建议通过根目录 `build.bat` 统一构建 |
 | `build_android.py` | 暂存安卓端源码并构建 APK；可用 `--prepare-only` 仅生成暂存目录 |
 | `check_runtime.py` | 使用临时空数据库检查服务启动及批量参数校验；安卓构建自动在固定依赖环境中运行 |
-| `daemon.ps1` | Windows 服务启动、状态检查、停止与守护 |
+| `daemon.ps1` | Windows 服务启动、状态检查、停止与守护；解释器按 `-Python` > `WB_PY` > `.venv` > PATH 依次探测 |
+| `service-console.ps1` | 控制台菜单：确保服务在跑，提供 1 关闭 / 2 重启 / 3 退出界面（不关服务）；入口是根目录 `start-console.bat` |
 | `watchdog.sh` | Linux HTTP 探活与异常重启，支持通过 `WB_*` 环境变量配置路径、用户和端口 |
 | `export_credential_key.py` | 从本机官方客户端生成私有凭证加解密配置，供服务器配置使用 |
 | `asar_grep.py` | 在本机 `app.asar` 数据区搜索文本或正则，输出上下文 |
@@ -17,9 +18,12 @@
 
 ```powershell
 .\build.bat --version 1.0.4
+.\start-console.bat
 powershell -File scripts\daemon.ps1 -Status
 powershell -File scripts\daemon.ps1 -Detach
 ```
+
+`start-console.bat` 是面向日常使用的入口：双击后自动确保服务在跑，再显示菜单（1 关闭服务 / 2 重启服务 / 3 退出界面但不关服务）。服务与守护都用 `Start-Process -WindowStyle Hidden` 脱离会话启动，关掉该窗口不会把服务带走。
 
 Linux 守护脚本的安装方式与环境变量见 `watchdog.sh` 文件头。Docker 部署优先使用 Compose 中已有的容器重启策略。
 

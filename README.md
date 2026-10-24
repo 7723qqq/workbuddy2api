@@ -298,7 +298,7 @@ python converter.py --host 127.0.0.1 --port 8787 --api-key "<自设访问密钥>
 
 ### 服务守护与备份
 
-- Windows：`powershell -File scripts/daemon.ps1 -Detach` 启动守护，`-Status` 查看状态，`-Stop` 停止。脚本默认使用项目 `.venv`。
+- Windows：双击根目录 `start-console.bat` 打开控制台（自动启动服务并显示菜单：1 关闭服务 / 2 重启服务 / 3 退出界面但不关服务）。也可直接 `powershell -File scripts/daemon.ps1 -Detach` 启动守护、`-Status` 查看状态、`-Stop` 停止。解释器按 `-Python` 参数 > `WB_PY` 环境变量 > 项目 `.venv` > PATH 中的 `python.exe` 依次探测，依赖装在系统 Python 上时无需额外配置。
 - Linux：使用 systemd、现有进程管理器或 `scripts/watchdog.sh`；脚本支持通过环境变量指定项目、Python、运行用户和端口，配置方法见文件头。
 - Docker：使用 Compose 已配置的 `restart: unless-stopped`；容器数据备份方法见前面的 Docker 章节。
 - SQLite 源码部署：停止服务后备份 `.env` 与实际数据库文件，再启动；MySQL 使用对应数据库备份工具。不要把数据库备份提交到仓库。
