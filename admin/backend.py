@@ -14,6 +14,7 @@ from datetime import datetime
 import httpx
 
 from converter import BACKEND, CredentialError, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
+from admin.config import settings
 
 #: 项目根加入 sys.path，便于导入根目录的 wb_install（与 converter 同级）。
 #: admin 包可能在 `uvicorn admin.server:app` 下被导入，此时根目录不一定在
@@ -223,7 +224,8 @@ class AccountSession:
     def http_client(self, timeout=15):
         """Reuse TLS connections throughout one account's task run."""
         if self._http is None:
-            self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS)
+            self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS,
+                                      trust_env=settings.UPSTREAM_TRUST_ENV)
         self._http.timeout = httpx.Timeout(timeout)
         yield self._http
 
@@ -263,7 +265,7 @@ class AccountSession:
 
     def fetch_model_busy(self, models: list[str]) -> dict:
         """Official desktop endpoint: at most 50 models, five-second timeout."""
-        with httpx.Client(timeout=5) as client:
+        with httpx.Client(timeout=5, trust_env=settings.UPSTREAM_TRUST_ENV) as client:
             response = client.post(f"{BACKEND}/v2/chat/busy", json={"models": models},
                                    headers=self.get_headers(cprofile.risk_headers()))
         response.raise_for_status()

@@ -128,6 +128,14 @@ from anthropic_adapter import (
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
+#: 上游请求是否继承本机系统代理（HTTP(S)_PROXY 环境变量 / Windows 注册表代理）。
+#: 默认 0（直连），语义与 admin/config.py 的 UPSTREAM_TRUST_ENV 一致。
+#:
+#: 为什么不能默认继承：本机的第三方代理（如 Steam++ 加速器的本地代理）会做 TLS
+#: 中间人并换发自签根证书（CN=SteamTools Certificate），而 httpx 默认信任的根证书
+#: 包里没有它 —— 于是每次上游调用都 CERTIFICATE_VERIFY_FAILED 失败，
+#: 号池里的号会一个接一个被降权（2026-10-24 线上故障：全池 503）。
+UPSTREAM_TRUST_ENV = os.getenv("ADMIN_UPSTREAM_TRUST_ENV", "0") == "1"
 #: 出站 User-Agent：**必须**伪装成官方客户端。
 #: 原来这里是 `codebuddy2openai/2.0` —— 一个自报家门的网关标识，上游「使用端」
 #: 列会直接显示它，等于对风控举手。（官方无任何 UA 随机化，故这里保持确定性。）
@@ -357,7 +365,7 @@ class CredentialManager:
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = f"{BACKEND}/v2/plugin/auth/token/refresh"
         try:
-            with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
+            with httpx.Client(timeout=15, limits=_HTTP_LIMITS, trust_env=UPSTREAM_TRUST_ENV) as c:
                 r = c.post(url, headers=headers, json={})
             data = r.json()
         except Exception as e:
@@ -468,7 +476,8 @@ class CredentialManager:
         else:
             headers = self.get_headers()
         try:
-            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS, **client_options) as c:
+            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS, trust_env=UPSTREAM_TRUST_ENV,
+                              **client_options) as c:
                 if method.upper() == "GET":
                     r = c.get(url, headers=headers, **request_options)
                 else:
@@ -492,7 +501,7 @@ class CredentialManager:
         headers = self.get_headers()
         url = f"{BACKEND}{path}"
         try:
-            with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
+            with httpx.Client(timeout=15, limits=_HTTP_LIMITS, trust_env=UPSTREAM_TRUST_ENV) as c:
                 if method.upper() == "GET":
                     r = c.get(url, headers=headers)
                 else:
@@ -576,7 +585,7 @@ class CredentialManager:
         headers = self.get_headers()
         url = f"{BACKEND}/v2/images/generations"
         try:
-            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS) as c:
+            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS, trust_env=UPSTREAM_TRUST_ENV) as c:
                 r = c.post(url, headers=headers, json=body)
         except Exception as e:
             raise RuntimeError(f"生图请求网络失败：{e}")
@@ -1050,7 +1059,8 @@ async def chat_completions(request: Request,
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                     trust_env=UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1258,7 +1268,8 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
         # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
         # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
         # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                     trust_env=UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1337,7 +1348,8 @@ async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, 
     # 这也是在消费一个 SSE 流（只是聚合成一次性字节），所以用同一套超时：
     # connect 短、read 管静默、**不设总时长**。原来的 timeout=120 会把 connect
     # 也设成 120s，遇到连不上的节点就一直挂着不换号。
-    async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+    async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                 trust_env=UPSTREAM_TRUST_ENV) as c:
         async with c.stream("POST", url, headers=headers, json=body) as r:
             chunks: list[bytes] = []
             async for chunk in r.aiter_bytes():
@@ -1567,7 +1579,8 @@ async def create_message(request: Request,
 
     # 非流式：聚合后端 SSE → 组装单个 Anthropic Message 对象
     try:
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                     trust_env=UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=chat_body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1637,7 +1650,8 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
         # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
         # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
         # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                     trust_env=UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()

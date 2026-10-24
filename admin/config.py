@@ -37,6 +37,23 @@ class Settings:
     # 后端（CodeBuddy / WorkBuddy）
     BACKEND = os.getenv("ADMIN_BACKEND", "https://copilot.tencent.com")
 
+    #: 上游请求是否继承本机系统代理（HTTP(S)_PROXY 环境变量 / Windows 注册表里的
+    #: 「Internet 设置 → 代理」）。
+    #:
+    #: 默认 0（直连），原因是上游请求头里带账号授权凭据，而本机常开着第三方代理
+    #: （例如 Steam++ 加速器的本地代理 127.0.0.1:10793）。这类代理会做 TLS 中间人，
+    #: 换发一张自签根证书（CN=SteamTools Certificate, O=BeyondDimension），
+    #: 而 httpx 默认信任的是 certifi 的根证书包，里面没有这张 —— 于是每次上游调用
+    #: 都会 CERTIFICATE_VERIFY_FAILED 失败。
+    #:
+    #: 这个故障的放大器是账号状态机：每个号记一次 transport 连败，累计到
+    #: BREAKER_THRESHOLD(5) 次就被降权 5 分钟，而前端把降权也渲染成「冷却」，
+    #: 于是 5 个号在 20 秒内全部显示冷却、全池 503（2026-10-24 线上即此故障）。
+    #:
+    #: 确实需要经代理出网时才置 1；此时 TLS 信任库必须包含该代理的根证书
+    #: （见 admin/upstream_http.py 的 ssl_context，已并入系统证书库）。
+    UPSTREAM_TRUST_ENV = os.getenv("ADMIN_UPSTREAM_TRUST_ENV", "0") == "1"
+
     # 本机 WorkBuddy/CodeBuddy 桌面端登录态目录（用于「扫描本机 / 注入切换」）
     CLIENT_AUTH_DIR = os.getenv(
         "ADMIN_CLIENT_AUTH_DIR",
